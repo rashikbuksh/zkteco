@@ -125,10 +125,13 @@ app.use(express.json());
 app.use("/iclock", express.text({ type: "*/*", limit: "10mb" }));
 
 // In-memory stores (replace with DB in prod)
-const pushedLogs = []; // raw items (ATTLOG, USERINFO, OPLOG, UNKNOWN)
-const deviceState = new Map(); // sn -> { lastStamp, lastSeenAt }
+const pushedLogs = []; // raw + enriched entries
+const deviceState = new Map(); // sn -> { lastStamp, lastSeenAt, lastUserSyncAt }
 const commandQueue = new Map(); // sn -> [ 'C: ...' ]
 const usersByDevice = new Map(); // sn -> Map(pin -> user)
+
+// SSE clients for real-time
+const sseClients = new Set();
 
 // Config
 const port = Number(PORT || 5099);
@@ -147,7 +150,6 @@ function ensureUserMap(sn) {
 	if (!usersByDevice.has(sn)) usersByDevice.set(sn, new Map());
 	return usersByDevice.get(sn);
 }
-
 function fmtYmdHms(d) {
 	const pad = (n) => String(n).padStart(2, "0");
 	const yyyy = d.getFullYear();
@@ -174,7 +176,6 @@ function maxTimestampYmdHms(items) {
 	if (!max) return null;
 	return fmtYmdHms(max);
 }
-
 function buildFetchCommand(sn) {
 	const st = deviceState.get(sn);
 	const now = new Date();
@@ -201,9 +202,7 @@ function buildFetchCommand(sn) {
 			return `C: DATA QUERY ATTLOG StartTime=${start} EndTime=${end}`;
 	}
 }
-
-// Map verify codes to a human-friendly method.
-// NOTE: codes vary by firmware. Adjust as needed for your device.
+// Map verify codes to method (adjust if your firmware differs)
 function verifyCodeToMethod(code) {
 	const c = Number(code);
 	const map = {
@@ -227,6 +226,19 @@ function verifyCodeToMethod(code) {
 	return map[c] || "unknown";
 }
 
+// Auto-queue a user fetch occasionally
+function maybeQueueUserSync(sn) {
+	const st = deviceState.get(sn) || {};
+	const last = st.lastUserSyncAt ? new Date(st.lastUserSyncAt) : null;
+	const now = new Date();
+	const stale = !last || now.getTime() - last.getTime() > 6 * 3600 * 1000; // 6h
+	if (stale) {
+		ensureQueue(sn).push("C: DATA QUERY USERINFO");
+		st.lastUserSyncAt = now.toISOString();
+		deviceState.set(sn, st);
+	}
+}
+
 // Health
 app.get("/health", (req, res) => {
 	res.json({
@@ -235,6 +247,7 @@ app.get("/health", (req, res) => {
 			sn,
 			lastStamp: s.lastStamp,
 			lastSeenAt: s.lastSeenAt,
+			lastUserSyncAt: s.lastUserSyncAt,
 		})),
 		users: Array.from(usersByDevice.entries()).map(([sn, m]) => ({
 			sn,
@@ -244,6 +257,33 @@ app.get("/health", (req, res) => {
 		commandSyntax,
 	});
 });
+
+// SSE real-time events
+app.get("/api/events/stream", (req, res) => {
+	res.set({
+		"Cache-Control": "no-cache",
+		"Content-Type": "text/event-stream",
+		Connection: "keep-alive",
+	});
+	res.flushHeaders();
+	res.write('event: ready\ndata: {"ok":true}\n\n');
+	sseClients.add(res);
+	req.on("close", () => {
+		sseClients.delete(res);
+		try {
+			res.end();
+		} catch (_) {}
+	});
+});
+
+function broadcastAttendance(event) {
+	const data = JSON.stringify(event);
+	for (const client of sseClients) {
+		try {
+			client.write(`event: attendance\ndata: ${data}\n\n`);
+		} catch (_) {}
+	}
+}
 
 // iClock/ADMS endpoints
 app.get("/iclock/ping", (req, res) => {
@@ -261,6 +301,9 @@ app.get("/iclock/getrequest", (req, res) => {
 	deviceState.set(sn, state);
 
 	const queue = ensureQueue(sn);
+	// Opportunistically refresh users
+	maybeQueueUserSync(sn);
+
 	if (queue.length) {
 		const body = queue.join("\n") + "\n";
 		queue.length = 0;
@@ -292,37 +335,66 @@ app.post("/iclock/cdata", (req, res) => {
 		receivedAt: nowISO,
 	}));
 
-	// Persist + enrich
+	// Persist users
 	for (const it of items) {
 		if (it.type === "USERINFO") {
-			// Store/merge user info by PIN
 			const umap = ensureUserMap(sn);
 			const pin = String(it.pin || "").trim();
 			if (pin) {
 				const existing = umap.get(pin) || {};
-				umap.set(pin, { ...existing, ...it });
+				umap.set(pin, { ...existing, ...it }); // keep uid/name/card/etc.
 			}
 		}
 	}
 
-	// Enrich ATTLOG with method
+	const umap = ensureUserMap(sn);
+
+	// Enrich ATTLOG with method + user info
 	const enriched = items.map((it) => {
-		if (it.type === "ATTLOG") {
-			return { ...it, method: verifyCodeToMethod(it.verify) };
-		}
-		return it;
+		if (it.type !== "ATTLOG") return it;
+		const user = umap.get(String(it.pin)) || {};
+		return {
+			...it,
+			method: verifyCodeToMethod(it.verify),
+			user: {
+				pin: user.pin || String(it.pin),
+				uid: user.uid || "",
+				name: user.name || "",
+				card: user.card || "",
+				privilege: user.privilege || "",
+				department: user.department || "",
+			},
+		};
 	});
 
 	pushedLogs.push(...enriched);
 
-	console.log("pushedLogs: ", pushedLogs);
+	console.log("pushedLogs", pushedLogs);
 
-	// Update device lastStamp to newest ATTLOG timestamp we received
+	// Update device lastStamp
 	const newest = maxTimestampYmdHms(enriched);
 	const st = deviceState.get(sn) || {};
 	if (newest) st.lastStamp = newest;
 	st.lastSeenAt = nowISO;
 	deviceState.set(sn, st);
+
+	// Broadcast real-time enriched ATTLOGs
+	for (const it of enriched) {
+		if (it.type === "ATTLOG") {
+			broadcastAttendance({
+				sn,
+				pin: it.pin,
+				uid: it.user?.uid || "",
+				name: it.user?.name || "",
+				card: it.user?.card || "",
+				timestamp: it.timestamp,
+				status: it.status,
+				verify: it.verify,
+				method: it.method,
+				table,
+			});
+		}
+	}
 
 	console.log(
 		`cdata SN=${sn} items=${items.length} newest=${newest || "n/a"}`
@@ -332,7 +404,7 @@ app.post("/iclock/cdata", (req, res) => {
 
 // Admin/dev helpers
 
-// Manually enqueue a pull for a device (one shot)
+// Pull attendance window (one shot)
 // Example: POST /api/device/pull?sn=VGU6244900359&hours=24
 app.post("/api/device/pull", (req, res) => {
 	const sn = req.query.sn || req.query.SN;
@@ -354,18 +426,22 @@ app.post("/api/device/pull", (req, res) => {
 	res.json({ ok: true, enqueued: cmd });
 });
 
-// Enqueue a user info pull (device will return USERINFO lines to /iclock/cdata)
+// Pull full user list now (device will return USERINFO lines to /iclock/cdata)
 app.post("/api/device/pull-users", (req, res) => {
 	const sn = req.query.sn || req.query.SN;
 	if (!sn) return res.status(400).json({ error: "sn is required" });
 
-	// Common command for Android push protocol:
 	const cmd = "C: DATA QUERY USERINFO";
 	ensureQueue(sn).push(cmd);
+
+	const st = deviceState.get(sn) || {};
+	st.lastUserSyncAt = new Date().toISOString();
+	deviceState.set(sn, st);
+
 	res.json({ ok: true, enqueued: cmd });
 });
 
-// Simplified view: attendance rows with only pin, timestamp, status, verify, method
+// Simplified view: attendance rows with user fields
 app.get("/api/attendances", (req, res) => {
 	const { sn } = req.query;
 	let data = pushedLogs.filter((x) => x.type === "ATTLOG");
@@ -374,6 +450,9 @@ app.get("/api/attendances", (req, res) => {
 	const simplified = data.map((x) => ({
 		sn: x.sn,
 		pin: x.pin,
+		uid: x.user?.uid || "",
+		name: x.user?.name || "",
+		card: x.user?.card || "",
 		timestamp: x.timestamp,
 		status: x.status,
 		verify: x.verify,
@@ -397,6 +476,7 @@ app.get("/api/users", (req, res) => {
 	const users = Array.from(m.values()).map((u) => ({
 		sn,
 		pin: u.pin,
+		uid: u.uid || "",
 		name: u.name,
 		card: u.card,
 		privilege: u.privilege,

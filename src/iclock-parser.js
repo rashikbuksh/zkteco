@@ -121,6 +121,10 @@
 // Handles both tagged lines (ATTLOG ...), and "plain" lines (PIN TIMESTAMP ...).
 // Also parses USERINFO key=value lines.
 
+// Parses iClock/ADMS push bodies from ZKTeco devices (SenseFace 3A compatible).
+// Handles both tagged lines (ATTLOG ...), and "plain" lines (PIN TIMESTAMP ...).
+// Also parses USERINFO key=value lines.
+
 function splitLines(raw) {
 	return String(raw)
 		.replace(/\r/g, "\n")
@@ -130,7 +134,6 @@ function splitLines(raw) {
 }
 
 function splitFields(line) {
-	// Try comma, tab, or space separation while preserving empty fields
 	if (line.includes(",")) return line.split(",").map((x) => x.trim());
 	if (line.includes("\t")) return line.split("\t").map((x) => x.trim());
 	return line
@@ -139,31 +142,15 @@ function splitFields(line) {
 		.map((x) => x.trim());
 }
 
-// yyyy-mm-dd hh:mm:ss
 function looksLikeYmdHms(s) {
 	return /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}$/.test(String(s));
 }
-
 function toISO(ts) {
 	if (!ts) return ts;
-	// Accept "YYYY-MM-DD HH:mm:ss" or ISO-like "YYYY-MM-DDTHH:mm:ss"
 	const norm = String(ts).includes(" ") ? ts.replace(" ", "T") : String(ts);
 	const d = new Date(norm);
 	return isNaN(d.getTime()) ? ts : d.toISOString();
 }
-
-/*
-Normalized ATTLOG shape:
-{
-  type: 'ATTLOG',
-  pin: '123',
-  timestamp: '2025-09-30T09:12:33.000Z',
-  status: 0,
-  verify: 7,
-  workcode: '0',
-  raw: originalLine
-}
-*/
 
 // Tagged format: "ATTLOG PIN TIMESTAMP STATUS VERIFY WORKCODE ..."
 function parseTaggedATTLOG(fields) {
@@ -183,7 +170,7 @@ function parseTaggedATTLOG(fields) {
 	};
 }
 
-// Plain format (common on Android): "PIN TIMESTAMP STATUS VERIFY WORKCODE r1 r2 r3 r4 r5 rid"
+// Plain format (Android): "PIN TIMESTAMP STATUS VERIFY WORKCODE r1 r2 r3 r4 r5 rid"
 function parsePlainATTLOG(fields) {
 	const pin = fields[0] ?? "";
 	const ts = fields[1] ?? "";
@@ -202,14 +189,9 @@ function parsePlainATTLOG(fields) {
 }
 
 function parseOPLOG(fields) {
-	return {
-		type: "OPLOG",
-		raw: fields.join("\t"),
-	};
+	return { type: "OPLOG", raw: fields.join("\t") };
 }
 
-// USERINFO lines typically look like:
-// "USERINFO\tPIN=1\tName=John Doe\tPrivilege=0\tCard=123456\t..."
 function parseKeyValuePairs(parts) {
 	const obj = {};
 	for (const p of parts) {
@@ -223,21 +205,23 @@ function parseKeyValuePairs(parts) {
 	return obj;
 }
 
+// USERINFO\tPIN=1\tName=John Doe\tPrivilege=0\tCard=123456\tUID=1001\t...
 function parseUSERINFO(fields) {
-	// fields[0] is "USERINFO" or "USER"
 	const kv = parseKeyValuePairs(fields.slice(1));
 	const pin = kv.PIN || kv.Pin || kv.pin || "";
 	const name = kv.Name || kv.Username || kv.NAME || "";
 	const card = kv.Card || kv.CardNo || kv.Badgenumber || "";
 	const privilege = kv.Privilege || kv.Pri || kv.Role || "";
-	const depart = kv.Dept || kv.Department || "";
+	const department = kv.Dept || kv.Department || kv.DEPT || "";
+	const uid = kv.UID || kv.UserID || kv.UserId || kv.userid || kv.uid || ""; // internal device user id if present
 	return {
 		type: "USERINFO",
 		pin: String(pin),
 		name,
 		card: String(card),
 		privilege: String(privilege),
-		department: String(depart),
+		department: String(department),
+		uid: String(uid),
 		raw: fields.join("\t"),
 		kv,
 	};
