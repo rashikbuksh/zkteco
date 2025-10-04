@@ -14,4 +14,7 @@ module.exports = {
 	),
 	DEFAULT_LOOKBACK_HOURS: Number(process.env.DEFAULT_LOOKBACK_HOURS || 48),
 	ICLOCK_COMMAND: process.env.ICLOCK_COMMAND || "ATTLOG",
+	USE_CRLF: ["1", "true", "yes"].includes(
+		String(process.env.USE_CRLF || "").toLowerCase()
+	),
 };
