@@ -301,20 +301,25 @@ app.get("/iclock/getrequest", (req, res) => {
 	deviceState.set(sn, state);
 
 	const queue = ensureQueue(sn);
-	// Opportunistically refresh users
 	maybeQueueUserSync(sn);
 
 	if (queue.length) {
-		const body = queue.join("\n") + "\n";
+		const sep = process.env.USE_CRLF ? "\r\n" : "\n";
+		const cmds = [...queue];
+		const body = cmds.join(sep) + sep;
+		console.log(
+			`[getrequest] SN=${sn} sending ${cmds.length} cmd(s):`,
+			cmds
+		);
 		queue.length = 0;
 		return res.status(200).send(body);
 	}
-
 	if (pullMode) {
 		const cmd = buildFetchCommand(sn);
-		return res.status(200).send(cmd);
+		const sep = process.env.USE_CRLF ? "\r\n" : "\n";
+		console.log(`[getrequest] SN=${sn} auto cmd: ${cmd}`);
+		return res.status(200).send(cmd + sep);
 	}
-
 	return res.status(200).send("");
 });
 
@@ -491,6 +496,112 @@ app.get("/api/push/logs", (req, res) => {
 	if (sn) data = data.filter((x) => x.sn === sn);
 	if (type) data = data.filter((x) => x.type === String(type).toUpperCase());
 	res.json({ count: data.length, logs: data });
+});
+
+app.get("/api/device/debug/queue", (req, res) => {
+	const sn = req.query.sn || req.query.SN;
+	if (!sn) return res.status(400).json({ error: "sn is required" });
+	const q = ensureQueue(sn);
+	res.json({ sn, queued: q });
+});
+
+app.post("/api/device/add-user", (req, res) => {
+	const sn = req.query.sn || req.query.SN;
+	if (!sn) return res.status(400).json({ error: "sn is required" });
+
+	const {
+		pin,
+		name,
+		card,
+		privilege,
+		department,
+		password,
+		pin2,
+		group,
+		minimal, // optional: send only required fields
+		sendVariants, // optional: also send alternate verbs
+		fullQuery, // optional: force full user list query
+	} = req.body || {};
+	if (!pin) return res.status(400).json({ error: "pin is required" });
+
+	const clean = (v) =>
+		String(v ?? "")
+			.replace(/[\r\n]/g, " ")
+			.trim();
+
+	const pinVal = clean(pin);
+	const nameVal = clean(name || "");
+	const cardVal = clean(card || "");
+	const priVal = Number(privilege ?? 0);
+	const deptVal = clean(department || "");
+	const pwdVal = clean(password || "");
+	const pin2Val = clean(pin2 || "");
+	const grpVal = clean(group || "");
+
+	// Base (use Pri= not Privilege=)
+	let base = `C: SET USERINFO PIN=${pinVal}`;
+	if (nameVal) base += ` Name=${nameVal}`;
+	base += ` Pri=${priVal}`;
+	if (!minimal && cardVal) base += ` Card=${cardVal}`;
+	if (!minimal && deptVal) base += ` Dept=${deptVal}`;
+	if (!minimal && pwdVal) base += ` Passwd=${pwdVal}`;
+	if (!minimal && pin2Val) base += ` PIN2=${pin2Val}`;
+	if (!minimal && grpVal) base += ` Grp=${grpVal}`;
+
+	const commands = [base];
+
+	// Alternate verb some firmwares accept
+	if (sendVariants) {
+		let alt = base.replace("SET USERINFO", "DATA UPDATE USERINFO");
+		if (alt === base)
+			alt = `C: DATA UPDATE USERINFO PIN=${pinVal} Pri=${priVal}`;
+		commands.push(alt);
+		// Minimal ultra-safe variant
+		commands.push(
+			`C: SET USERINFO PIN=${pinVal}${
+				nameVal ? ` Name=${nameVal}` : ""
+			} Pri=${priVal}`
+		);
+	}
+
+	// Query that PIN (may be ignored, harmless if unsupported)
+	commands.push(`C: DATA QUERY USERINFO PIN=${pinVal}`);
+
+	// Full list query to force refresh
+	if (fullQuery || sendVariants) {
+		commands.push("C: DATA QUERY USERINFO");
+	}
+
+	const q = ensureQueue(sn);
+	commands.forEach((c) => q.push(c));
+
+	console.log(
+		`[add-user] SN=${sn} queued ${commands.length} line(s):`,
+		commands
+	);
+
+	// Optimistic cache
+	const umap = ensureUserMap(sn);
+	const existing = umap.get(pinVal) || {};
+	umap.set(pinVal, {
+		...existing,
+		pin: pinVal,
+		name: nameVal,
+		card: cardVal,
+		privilege: String(priVal),
+		department: deptVal,
+		password: pwdVal ? "****" : undefined,
+		pin2: pin2Val || undefined,
+		group: grpVal || undefined,
+		updatedLocallyAt: new Date().toISOString(),
+	});
+
+	return res.json({
+		ok: true,
+		enqueued: commands,
+		queueSize: q.length,
+		note: "Wait for /iclock/getrequest. If still missing, set USE_CRLF=1 and try minimal=true&sendVariants=true.",
+	});
 });
 
 app.listen(port, () => {
