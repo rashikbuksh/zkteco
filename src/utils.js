@@ -28,35 +28,59 @@ function verifyCodeToMethod(code) {
 
 function fmtYmdHms(date) {
   if (!date) return date;
-
-  if (typeof date === 'string') {
-    const parsed = parseISO(date);
-    if (!isValid(parsed)) return d;
-    date = parsed;
-  } else if (!(date instanceof Date)) {
-    date = new Date(date);
-    if (!isValid(date)) return d;
+  let d = date;
+  if (typeof d === 'string') {
+    try {
+      // Accept timestamps already in ISO or 'YYYY-MM-DD HH:mm:ss'
+      const normalized = d.includes(' ') ? d.replace(' ', 'T') : d;
+      const parsed = parseISO(normalized);
+      if (isValid(parsed)) d = parsed;
+      else return date; // return original string if invalid
+    } catch {
+      return date;
+    }
+  } else if (!(d instanceof Date)) {
+    d = new Date(d);
+    if (!isValid(d)) return date;
   }
-
-  return format(date, 'yyyy-MM-dd HH:mm:ss');
+  return format(d, 'yyyy-MM-dd HH:mm:ss');
 }
 
 function toISO(ts) {
   if (!ts) return ts;
-  if (!isValid(parseISO(ts))) return ts;
-
-  return formatISO(ts);
+  // If already a Date
+  if (ts instanceof Date) {
+    if (!isValid(ts)) return ts;
+    return ts.toISOString();
+  }
+  // If numeric (ms since epoch)
+  if (typeof ts === 'number') {
+    const d = new Date(ts);
+    return isValid(d) ? d.toISOString() : ts;
+  }
+  if (typeof ts === 'string') {
+    const s = ts.includes(' ') ? ts.replace(' ', 'T') : ts;
+    try {
+      const d = parseISO(s);
+      if (isValid(d)) return d.toISOString();
+    } catch {
+      return ts;
+    }
+  }
+  return ts;
 }
 
 function maxTimestampYmdHms(items) {
-  let max = null;
+  let maxDate = null;
   for (const it of items) {
     if (it.type !== 'ATTLOG') continue;
-    const d = toISO(it.timestamp);
-    if (d && (!max || d > max)) max = d;
+    const iso = toISO(it.timestamp);
+    if (typeof iso !== 'string') continue;
+    const d = new Date(iso);
+    if (!isValid(d)) continue;
+    if (!maxDate || d > maxDate) maxDate = d;
   }
-  if (!max) return null;
-  return fmtYmdHms(max);
+  return maxDate ? fmtYmdHms(maxDate) : null;
 }
 
 module.exports = {

@@ -1,7 +1,7 @@
 const express = require('express');
 const { parseCData } = require('./iclock-parser');
 const { PORT, PULL_MODE, DEFAULT_LOOKBACK_HOURS, ICLOCK_COMMAND, USE_CRLF } = require('./config');
-const { toISO } = require('./utils');
+const { toISO, verifyCodeToMethod, fmtYmdHms, maxTimestampYmdHms } = require('./utils');
 
 const app = express();
 app.use(express.json());
@@ -47,8 +47,22 @@ function buildFetchCommand(sn) {
   let start;
 
   if (st?.lastStamp) {
-    const last = toISO(st.lastStamp.replace(' ', 'T'));
-    const s = new Date((last?.getTime() || now.getTime()) - 1000);
+    // st.lastStamp is stored as a Y-m-d H:M:S string (not a Date). toISO() returns a string,
+    // so calling getTime() on it caused: TypeError: last?.getTime is not a function.
+    // Parse safely into a Date and fall back to now if invalid.
+    const raw = String(st.lastStamp).trim();
+    let parsed = new Date(raw.includes('T') ? raw : raw.replace(' ', 'T'));
+    if (isNaN(parsed.getTime())) {
+      // Attempt secondary parse via Date components (YYYY-MM-DD HH:mm:ss)
+      const m = raw.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})$/);
+      if (m) {
+        const [_, Y, M, D, h, i, s] = m;
+        parsed = new Date(Number(Y), Number(M) - 1, Number(D), Number(h), Number(i), Number(s));
+      }
+    }
+    if (isNaN(parsed.getTime())) parsed = now;
+    // Subtract 1s to avoid missing the next edge record (device returns > start)
+    const s = new Date(parsed.getTime() - 1000);
     start = fmtYmdHms(s);
   } else {
     const s = new Date(now.getTime() - defaultLookbackHours * 3600 * 1000);
@@ -250,7 +264,7 @@ app.post('/iclock/cdata', (req, res) => {
   const newest = maxTimestampYmdHms(enriched);
   const st = deviceState.get(sn) || {};
   if (newest) st.lastStamp = newest;
-  st.lastSeenAt = nowISO;
+  st.lastSeenAt = new Date().toISOString();
   deviceState.set(sn, st);
 
   // Broadcast real-time enriched ATTLOGs
@@ -424,6 +438,7 @@ app.post('/api/device/add-user', (req, res) => {
   }
   const autoKey = devicePinKey.get(sn);
   const pinLabel = (pinKey || autoKey || 'PIN').trim();
+  const uIdLabel = 'UID'; // Fixed: removed uid variable conflict
   const baseParts = [`${pinLabel}=${pinVal}`];
   if (nameVal) baseParts.push(`Name=${nameVal}`);
   baseParts.push(`Pri=${priVal}`);
@@ -445,6 +460,14 @@ app.post('/api/device/add-user', (req, res) => {
     commands.push(`C: DATA UPDATE USERINFO ${join(updateParts)}`);
     // Minimal SET (only PIN + Pri)
     commands.push(
+      `C: SET USERINFO ${join([
+        `User Id=${pinVal}`,
+        `Name=${nameVal}`,
+        `UserRole=${priVal}`,
+        `UID=${uId}`,
+      ])}`
+    );
+    commands.push(
       `C: SET USERINFO ${join([`${pinLabel}=${pinVal}`, `Pri=${priVal}`, `UID=${uId}`])}`
     );
     // Privilege= variant
@@ -454,6 +477,7 @@ app.post('/api/device/add-user', (req, res) => {
       `Privilege=${priVal}`,
       cardVal ? `Card=${cardVal}` : null,
       deptVal ? `Dept=${deptVal}` : null,
+      uId ? `UID=${uId}` : null,
     ].filter(Boolean);
     commands.push(`C: SET USERINFO ${join(privParts)}`);
     // CardNo variant
@@ -463,6 +487,7 @@ app.post('/api/device/add-user', (req, res) => {
         nameVal ? `Name=${nameVal}` : null,
         `Pri=${priVal}`,
         `CardNo=${cardVal}`,
+        uId ? `UID=${uId}` : null,
       ].filter(Boolean);
       commands.push(`C: SET USERINFO ${join(cardNoParts)}`);
     }
@@ -473,11 +498,13 @@ app.post('/api/device/add-user', (req, res) => {
         `Card=${cardVal}`,
         nameVal ? `Name=${nameVal}` : null,
         `Pri=${priVal}`,
+        uId ? `UID=${uId}` : null,
       ].filter(Boolean);
       commands.push(`C: SET USER ${join(reorder)}`);
     }
     // GET single user
     commands.push(`C: GET USER ${pinLabel}=${pinVal}`);
+    commands.push(`C: GET USER ${uIdLabel}=${uId}`);
     // Possible commit (rarely needed, harmless if ignored)
     commands.push(`C: COMMIT USER`);
     // Plain USER line without verb (some odd firmware treat it as implicit SET)
@@ -541,6 +568,22 @@ app.post('/api/device/add-user', (req, res) => {
     pinLabelUsed: pinLabel,
     autoDetectedPinKey: autoKey || null,
   });
+});
+
+// Quick test helper (optional)
+app.post('/api/device/add-user/test', (req, res) => {
+  const sn = req.query.sn || req.query.SN;
+  if (!sn) return res.status(400).json({ error: 'sn is required' });
+  const n = Date.now() % 100000;
+  req.body = {
+    pin: String(n),
+    name: 'Test' + n,
+    card: String(n),
+    privilege: 0,
+    minimal: true,
+    sendVariants: true,
+  };
+  return app._router.handle(req, res, () => {}, 'post', '/api/device/add-user');
 });
 
 // Delete a user (queue multiple deletion variants)
