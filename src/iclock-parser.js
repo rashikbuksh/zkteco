@@ -124,7 +124,7 @@ function parseCData(raw) {
       default:
         if (fields.length >= 2 && looksLikeYmdHms(fields[1]))
           entries.push(parseATTLOG(fields, 'plain'));
-
+        console.log('[cdata] unknown line:', line);
         entries.push({ type: 'UNKNOWN', raw: line });
         break;
     }

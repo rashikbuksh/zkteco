@@ -20,6 +20,8 @@ const commandQueue = new Map(); // sn -> [ 'C: ...' ]
 const usersByDevice = new Map(); // sn -> Map(pin -> user)
 const devicePinKey = new Map(); // sn -> preferred PIN field key (PIN, Badgenumber, EnrollNumber, etc.)
 const sseClients = new Set(); // SSE clients for real-time
+// NOTE: Optimistic creation: we tag locally created (not yet confirmed) users with optimistic=true
+// When a real USERINFO for that PIN arrives, we remove the optimistic flag and stamp confirmedAt
 
 // Config
 const port = PORT;
@@ -223,7 +225,15 @@ app.post('/iclock/cdata', (req, res) => {
       const pin = String(it.pin || '').trim();
       if (pin) {
         const existing = umap.get(pin) || {};
-        umap.set(pin, { ...existing, ...it }); // keep uid/name/card/etc.
+        const nowIso = new Date().toISOString();
+        // Merge device authoritative fields, clear optimistic flag if present
+        const merged = { ...existing, ...it };
+        if (existing.optimistic) {
+          delete merged.optimistic;
+          merged.confirmedAt = nowIso;
+          if (!merged.createdAt) merged.createdAt = existing.createdAt || nowIso;
+        }
+        umap.set(pin, merged); // keep uid/name/card/etc.
       }
 
       // Auto-detect which key label the device uses for PIN / badge on first sight
@@ -414,6 +424,7 @@ app.post('/api/device/add-user', (req, res) => {
     single, // if true send only the base command
     style, // 'spaces' to use spaces instead of tabs
     uid, // optional internal user id
+    optimistic,
   } = req.body || {};
   if (!pin) return res.status(400).json({ error: 'pin is required' });
 
@@ -547,18 +558,35 @@ app.post('/api/device/add-user', (req, res) => {
   // Optimistic cache
   const umap = ensureUserMap(sn);
   const existing = umap.get(pinVal) || {};
-  umap.set(pinVal, {
-    ...existing,
-    pin: pinVal,
-    name: nameVal,
-    card: cardVal,
-    privilege: String(priVal),
-    department: deptVal,
-    password: pwdVal ? '****' : undefined,
-    pin2: pin2Val || undefined,
-    group: grpVal || undefined,
-    updatedLocallyAt: new Date().toISOString(),
-  });
+  const nowIso = new Date().toISOString();
+  let optimisticApplied = false;
+  // If client explicitly sets optimistic=false, skip local insertion until device confirms
+  if (optimistic === false) {
+    // Still record a placeholder state so UI can show pending without exposing details
+    umap.set(pinVal, {
+      ...existing,
+      pin: pinVal,
+      name: existing.name, // preserve existing if any
+      pending: true,
+      queuedAt: nowIso,
+    });
+  } else {
+    optimisticApplied = true;
+    umap.set(pinVal, {
+      ...existing,
+      pin: pinVal,
+      name: nameVal,
+      card: cardVal,
+      privilege: String(priVal),
+      department: deptVal,
+      password: pwdVal ? '****' : undefined,
+      pin2: pin2Val || undefined,
+      group: grpVal || undefined,
+      updatedLocallyAt: nowIso,
+      createdAt: existing.createdAt || nowIso,
+      optimistic: true,
+    });
+  }
 
   return res.json({
     ok: true,
@@ -567,6 +595,7 @@ app.post('/api/device/add-user', (req, res) => {
     note: 'If user still absent: ensure USE_CRLF=1, try minimal=true&compat=true, review /iclock/cdata for USER reply, and verify device allows remote user creation.',
     pinLabelUsed: pinLabel,
     autoDetectedPinKey: autoKey || null,
+    optimisticApplied,
   });
 });
 
@@ -669,6 +698,39 @@ app.post('/api/device/enqueue-command', (req, res) => {
   }
   console.log(`[enqueue-command] SN=${sn} added ${lines.length} line(s).`);
   res.json({ ok: true, queued: q.length });
+});
+
+app.post('/api/device/add-user-minimal', (req, res) => {
+  const sn = req.query.sn || req.query.SN;
+  if (!sn) return res.status(400).json({ error: 'sn is required' });
+  const { pin, name, privilege = 0, card } = req.body || {};
+  if (!pin) return res.status(400).json({ error: 'pin is required' });
+
+  const pinVal = String(pin).trim();
+  const nameVal = (name || '').replace(/[\r\n]/g, ' ').trim();
+  const cardVal = (card || pinVal).trim();
+
+  const cmd = `C: SET USERINFO PIN=${pinVal}${
+    nameVal ? ` Name=${nameVal}` : ''
+  } Privilege=${privilege} Card=${cardVal}`;
+  const q = ensureQueue(sn);
+  q.push(cmd);
+  q.push('C: DATA QUERY USERINFO'); // full list to confirm
+  console.log(`[add-user-minimal] SN=${sn} queued:\n  > ${cmd}`);
+  res.json({ ok: true, enqueued: [cmd], queueSize: q.length });
+});
+
+app.post('/api/device/custom-command', (req, res) => {
+  const sn = req.query.sn || req.query.SN;
+  if (!sn) return res.status(400).json({ error: 'sn is required' });
+  const { command } = req.body || {};
+  if (!command) return res.status(400).json({ error: 'command is required' });
+  let cmd = String(command).trim();
+  if (!cmd.startsWith('C:')) cmd = `C: ${cmd}`;
+  const q = ensureQueue(sn);
+  q.push(cmd);
+  console.log(`[custom-command] SN=${sn} queued:\n  > ${cmd}`);
+  res.json({ ok: true, enqueued: [cmd], queueSize: q.length });
 });
 
 app.listen(port, () => {
