@@ -1,13 +1,20 @@
 {
-	"cSpell.words": [
-		"ADMS",
-		"ATTLOG",
-		"Badgenumber",
-		"getrequest",
-		"iclock",
-		"LOOKBACK",
-		"OPLOG",
-		"umap",
-		"workcode"
-	]
+  "cSpell.words": [
+    "ADMS",
+    "ATTLOG",
+    "Badgenumber",
+    "getrequest",
+    "iclock",
+    "LOOKBACK",
+    "OPLOG",
+    "umap",
+    "workcode"
+  ],
+  "editor.formatOnSave": true,
+  "editor.defaultFormatter": "esbenp.prettier-vscode",
+  "prettier.singleQuote": true,
+  "prettier.trailingComma": "es5",
+  "prettier.semi": true,
+  "prettier.printWidth": 150,
+  "prettier.tabWidth": 2
 }
