@@ -1,121 +1,15 @@
-// const express = require("express");
-// const { port } = require("./config");
-// const { parseCData } = require("./iclock-parser");
-
-// const app = express();
-
-// app.use("/", (req, res, next) => {
-// 	console.log(`${req.method} -  ${req.url}`);
-// 	next();
-// });
-
-// // JSON for normal API routes
-// app.use(express.json());
-
-// // Text parser for iClock push (SenseFace 3A posts text/plain)
-// app.use("/iclock", express.text({ type: "*/*", limit: "10mb" }));
-
-// // In-memory store for demo; replace with your DB
-// // user id, device sn, timestamp, punch type, etc.
-// const pushedLogs = [];
-
-// // Health
-// app.get("/health", (req, res) => {
-// 	res.json({
-// 		ok: true,
-// 		timestamp: new Date().toISOString(),
-// 	});
-// });
-
-// // --- iClock/ADMS Push endpoints ---
-// // Device should be configured to: http://<your-ip>:3000/iclock/
-
-// // Heartbeat/command pull
-// app.get("/iclock/getrequest", (req, res) => {
-// 	// Query often includes SN=<serial>, OPTION, etc.
-// 	// You can return pending "C:..." lines for commands. For now, return empty.
-// 	res.status(200).send("");
-// });
-
-// // Attendance data push
-// app.post("/iclock/cdata", (req, res) => {
-// 	console.log("body", req.body);
-// 	const sn = req.query.SN || req.query.sn || ""; // device serial number
-
-// 	const raw = req.body || "";
-// 	const table = req.query.table || ""; // sometimes included
-
-// 	const items = parseCData(raw).map((e) => ({
-// 		...e,
-// 		sn,
-// 		table,
-// 		receivedAt: new Date().toISOString(),
-// 	}));
-
-// 	// Persist
-// 	pushedLogs.push(...items);
-
-// 	// Log a small preview
-// 	const preview = items
-// 		.slice(0, 3)
-// 		.map((i) => i.raw || `${i.type}:${i.pin || ""}`)
-// 		.join("\n");
-
-// 	// Important: device expects "OK" to acknowledge receipt
-// 	res.status(200).send("OK");
-// });
-
-// app.get("/iclock/ping", (req, res) => {
-// 	// get ip from req
-// 	const ip = req.ip;
-// 	const sn = req.query.SN || req.query.sn || ""; // device serial number
-
-// 	console.log("Ping from", sn, "at", ip);
-
-// 	res.status(200).send({
-// 		ip,
-// 		sn,
-// 		Timestamp: new Date().toISOString(),
-// 	});
-// });
-
-// // Optional: Some firmwares send device info to /iclock/devicecmd or /iclock/fdata
-// app.post("/iclock/devicecmd", (req, res) => {
-// 	console.log("devicecmd:", req.body);
-// 	res.status(200).send("OK");
-// });
-// app.post("/iclock/fdata", (req, res) => {
-// 	// For photo/template payloads if enabled (not always used)
-// 	console.log("fdata len:", (req.body || "").length);
-// 	res.status(200).send("OK");
-// });
-
-// // Query pushed logs
-// app.get("/api/push/logs", (req, res) => {
-// 	const { sn, type } = req.query;
-// 	let data = pushedLogs;
-// 	if (sn) data = data.filter((x) => x.sn === sn);
-// 	if (type) data = data.filter((x) => x.type === String(type).toUpperCase());
-// 	res.json({ count: data.length, logs: data });
-// });
-
-// app.listen(port, () => {
-// 	console.log(`SenseFace 3A server listening on http://localhost:${port}`);
-// });
-
-const express = require("express");
-const { parseCData } = require("./iclock-parser");
-
+const express = require('express');
+const { parseCData } = require('./iclock-parser');
 const {
 	PORT,
 	PULL_MODE,
 	DEFAULT_LOOKBACK_HOURS,
 	ICLOCK_COMMAND,
 	USE_CRLF,
-} = require("./config");
+} = require('./config');
+const { toISO } = require('./utils');
 
 const app = express();
-
 app.use(express.json());
 
 // app.use("/", (req, res, next) => {
@@ -123,7 +17,7 @@ app.use(express.json());
 // 	next();
 // });
 
-app.use("/iclock", express.text({ type: "*/*", limit: "10mb" }));
+app.use('/iclock', express.text({ type: '*/*', limit: '10mb' }));
 
 // In-memory stores (replace with DB in prod)
 const pushedLogs = []; // raw + enriched entries
@@ -131,17 +25,15 @@ const deviceState = new Map(); // sn -> { lastStamp, lastSeenAt, lastUserSyncAt 
 const commandQueue = new Map(); // sn -> [ 'C: ...' ]
 const usersByDevice = new Map(); // sn -> Map(pin -> user)
 const devicePinKey = new Map(); // sn -> preferred PIN field key (PIN, Badgenumber, EnrollNumber, etc.)
-
-// SSE clients for real-time
-const sseClients = new Set();
+const sseClients = new Set(); // SSE clients for real-time
 
 // Config
-const port = Number(PORT || 5099);
-const pullMode = ["1", "true", "yes"].includes(
-	String(PULL_MODE || "").toLowerCase()
-);
-const defaultLookbackHours = Number(DEFAULT_LOOKBACK_HOURS || 48);
-const commandSyntax = String(ICLOCK_COMMAND || "DATA_QUERY").toUpperCase();
+const port = PORT;
+const pullMode = PULL_MODE;
+const defaultLookbackHours = DEFAULT_LOOKBACK_HOURS;
+
+//! here is a problem
+const commandSyntax = String(ICLOCK_COMMAND || 'DATA_QUERY').toUpperCase();
 let dripMode = false; // when true, send only one command per /iclock/getrequest poll
 
 // Utilities
@@ -153,32 +45,7 @@ function ensureUserMap(sn) {
 	if (!usersByDevice.has(sn)) usersByDevice.set(sn, new Map());
 	return usersByDevice.get(sn);
 }
-function fmtYmdHms(d) {
-	const pad = (n) => String(n).padStart(2, "0");
-	const yyyy = d.getFullYear();
-	const mm = pad(d.getMonth() + 1);
-	const dd = pad(d.getDate());
-	const hh = pad(d.getHours());
-	const mi = pad(d.getMinutes());
-	const ss = pad(d.getSeconds());
-	return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
-}
-function parseISOOrReturn(s) {
-	const t = Date.parse(s);
-	if (!isNaN(t)) return new Date(t);
-	const d = new Date(String(s).replace(" ", "T"));
-	return isNaN(d.getTime()) ? null : d;
-}
-function maxTimestampYmdHms(items) {
-	let max = null;
-	for (const it of items) {
-		if (it.type !== "ATTLOG") continue;
-		const d = parseISOOrReturn(it.timestamp);
-		if (d && (!max || d > max)) max = d;
-	}
-	if (!max) return null;
-	return fmtYmdHms(max);
-}
+
 function buildFetchCommand(sn) {
 	const st = deviceState.get(sn);
 	const now = new Date();
@@ -186,7 +53,7 @@ function buildFetchCommand(sn) {
 	let start;
 
 	if (st?.lastStamp) {
-		const last = parseISOOrReturn(st.lastStamp.replace(" ", "T"));
+		const last = toISO(st.lastStamp.replace(' ', 'T'));
 		const s = new Date((last?.getTime() || now.getTime()) - 1000);
 		start = fmtYmdHms(s);
 	} else {
@@ -195,38 +62,15 @@ function buildFetchCommand(sn) {
 	}
 
 	switch (commandSyntax) {
-		case "DATA_QUERY":
+		case 'DATA_QUERY':
 			return `C: DATA QUERY ATTLOG StartTime=${start} EndTime=${end}`;
-		case "GET_ATTLOG":
+		case 'GET_ATTLOG':
 			return `C: GET ATTLOG StartTime=${start} EndTime=${end}`;
-		case "ATTLOG":
+		case 'ATTLOG':
 			return `C: ATTLOG`;
 		default:
 			return `C: DATA QUERY ATTLOG StartTime=${start} EndTime=${end}`;
 	}
-}
-// Map verify codes to method (adjust if your firmware differs)
-function verifyCodeToMethod(code) {
-	const c = Number(code);
-	const map = {
-		0: "password",
-		1: "fingerprint",
-		2: "password",
-		3: "card",
-		4: "fingerprint+password",
-		5: "card+password",
-		6: "fingerprint+card",
-		7: "fingerprint+card+password",
-		8: "face",
-		9: "face+password",
-		10: "face+card",
-		11: "face+card+password",
-		12: "face+fingerprint",
-		13: "face+fingerprint+password",
-		14: "face+fingerprint+card",
-		15: "face+fingerprint+card+password",
-	};
-	return map[c] || "unknown";
 }
 
 // Auto-queue a user fetch occasionally
@@ -236,14 +80,14 @@ function maybeQueueUserSync(sn) {
 	const now = new Date();
 	const stale = !last || now.getTime() - last.getTime() > 6 * 3600 * 1000; // 6h
 	if (stale) {
-		ensureQueue(sn).push("C: DATA QUERY USERINFO");
+		ensureQueue(sn).push('C: DATA QUERY USERINFO');
 		st.lastUserSyncAt = now.toISOString();
 		deviceState.set(sn, st);
 	}
 }
 
 // Health
-app.get("/health", (req, res) => {
+app.get('/health', (req, res) => {
 	res.json({
 		ok: true,
 		devices: Array.from(deviceState.entries()).map(([sn, s]) => ({
@@ -262,16 +106,16 @@ app.get("/health", (req, res) => {
 });
 
 // SSE real-time events
-app.get("/api/events/stream", (req, res) => {
+app.get('/api/events/stream', (req, res) => {
 	res.set({
-		"Cache-Control": "no-cache",
-		"Content-Type": "text/event-stream",
-		Connection: "keep-alive",
+		'Cache-Control': 'no-cache',
+		'Content-Type': 'text/event-stream',
+		Connection: 'keep-alive',
 	});
 	res.flushHeaders();
 	res.write('event: ready\ndata: {"ok":true}\n\n');
 	sseClients.add(res);
-	req.on("close", () => {
+	req.on('close', () => {
 		sseClients.delete(res);
 		try {
 			res.end();
@@ -289,23 +133,26 @@ function broadcastAttendance(event) {
 }
 
 // iClock/ADMS endpoints
-app.get("/iclock/ping", (req, res) => {
-	const sn = req.query.SN || req.query.sn || "";
+app.get('/iclock/ping', (req, res) => {
+	const sn = req.query.SN || req.query.sn || '';
 	const state = deviceState.get(sn) || {};
 	state.lastSeenAt = new Date().toISOString();
+
 	deviceState.set(sn, state);
-	res.status(200).send("OK");
+
+	res.status(200).send('OK');
 });
 
-app.get("/iclock/getrequest", (req, res) => {
-	const sn = req.query.SN || req.query.sn || "";
+app.get('/iclock/getrequest', (req, res) => {
+	const sn = req.query.SN || req.query.sn || '';
 	const state = deviceState.get(sn) || {};
 	state.lastSeenAt = new Date().toISOString();
+
 	deviceState.set(sn, state);
 
 	// Debug: log each poll (can be noisy; comment out if too verbose)
 	if (ensureQueue(sn).length > 0)
-		console.log(
+		console.warn(
 			`[getrequest] poll SN=${sn} pullMode=${pullMode} queued=${
 				ensureQueue(sn).length
 			}`
@@ -315,7 +162,7 @@ app.get("/iclock/getrequest", (req, res) => {
 	maybeQueueUserSync(sn);
 
 	if (queue.length) {
-		const sep = USE_CRLF ? "\r\n" : "\n";
+		const sep = USE_CRLF ? '\r\n' : '\n';
 		let cmds;
 		if (dripMode) {
 			cmds = [queue.shift()];
@@ -333,34 +180,35 @@ app.get("/iclock/getrequest", (req, res) => {
 	}
 	if (pullMode) {
 		const cmd = buildFetchCommand(sn);
-		const sep = USE_CRLF ? "\r\n" : "\n";
+		const sep = USE_CRLF ? '\r\n' : '\n';
 		// console.log(`[getrequest] SN=${sn} auto cmd: ${cmd}`);
 		return res.status(200).send(cmd + sep);
 	}
 	console.log(`[getrequest] SN=${sn} idle (no commands, pullMode=false)`);
-	return res.status(200).send("");
+	return res.status(200).send('');
 });
 
-// Some firmwares probe with GET /iclock/cdata — acknowledge OK
-app.get("/iclock/cdata", (req, res) => res.status(200).send("OK"));
+// Some firmware probe with GET /iclock/cdata — acknowledge OK
+app.get('/iclock/cdata', (req, res) =>
+	res.status(200).send('OK: Nothing handled in here')
+);
 
 // Device posts logs here in plain text
-app.post("/iclock/cdata", (req, res) => {
-	const sn = req.query.SN || req.query.sn || "";
-	const table = req.query.table || req.query.options || "";
-	const raw = req.body || "";
-	const nowISO = new Date().toISOString();
+app.post('/iclock/cdata', (req, res) => {
+	const sn = req.query.SN || req.query.sn || '';
+	const table = req.query.table || req.query.options || '';
+	const raw = req.body || '';
 
 	// Debug summary of payload
 	const rawLines = String(raw)
-		.replace(/\r/g, "\n")
-		.split("\n")
+		.replace(/\r/g, '\n')
+		.split('\n')
 		.filter(Boolean);
 	console.log(
 		`[cdata] SN=${sn} table=${table} lines=${
 			rawLines.length
 		} bytes=${Buffer.byteLength(String(raw))} firstLine=${
-			rawLines[0] ? JSON.stringify(rawLines[0]) : "<empty>"
+			rawLines[0] ? JSON.stringify(rawLines[0]) : '<empty>'
 		}`
 	);
 
@@ -368,14 +216,14 @@ app.post("/iclock/cdata", (req, res) => {
 		...e,
 		sn,
 		table,
-		receivedAt: nowISO,
+		receivedAt: toISO(new Date()),
 	}));
 
 	// Persist users
 	for (const it of items) {
-		if (it.type === "USERINFO") {
+		if (it.type === 'USERINFO') {
 			const umap = ensureUserMap(sn);
-			const pin = String(it.pin || "").trim();
+			const pin = String(it.pin || '').trim();
 			if (pin) {
 				const existing = umap.get(pin) || {};
 				umap.set(pin, { ...existing, ...it }); // keep uid/name/card/etc.
@@ -384,10 +232,10 @@ app.post("/iclock/cdata", (req, res) => {
 			// Auto-detect which key label the device uses for PIN / badge on first sight
 			if (!devicePinKey.get(sn) && it.kv) {
 				const kv = it.kv;
-				if (kv.Badgenumber) devicePinKey.set(sn, "Badgenumber");
-				else if (kv.EnrollNumber) devicePinKey.set(sn, "EnrollNumber");
+				if (kv.Badgenumber) devicePinKey.set(sn, 'Badgenumber');
+				else if (kv.EnrollNumber) devicePinKey.set(sn, 'EnrollNumber');
 				else if (kv.PIN || kv.Pin || kv.pin)
-					devicePinKey.set(sn, "PIN");
+					devicePinKey.set(sn, 'PIN');
 			}
 		}
 	}
@@ -396,25 +244,25 @@ app.post("/iclock/cdata", (req, res) => {
 
 	// Enrich ATTLOG with method + user info
 	const enriched = items.map((it) => {
-		if (it.type !== "ATTLOG") return it;
+		if (it.type !== 'ATTLOG') return it;
 		const user = umap.get(String(it.pin)) || {};
 		return {
 			...it,
 			method: verifyCodeToMethod(it.verify),
 			user: {
 				pin: user.pin || String(it.pin),
-				uid: user.uid || "",
-				name: user.name || "",
-				card: user.card || "",
-				privilege: user.privilege || "",
-				department: user.department || "",
+				uid: user.uid || '',
+				name: user.name || '',
+				card: user.card || '',
+				privilege: user.privilege || '',
+				department: user.department || '',
 			},
 		};
 	});
 
 	pushedLogs.push(...enriched);
 
-	console.log("pushedLogs", pushedLogs);
+	console.log('pushedLogs', pushedLogs);
 
 	// Update device lastStamp
 	const newest = maxTimestampYmdHms(enriched);
@@ -425,13 +273,13 @@ app.post("/iclock/cdata", (req, res) => {
 
 	// Broadcast real-time enriched ATTLOGs
 	for (const it of enriched) {
-		if (it.type === "ATTLOG") {
+		if (it.type === 'ATTLOG') {
 			broadcastAttendance({
 				sn,
 				pin: it.pin,
-				uid: it.user?.uid || "",
-				name: it.user?.name || "",
-				card: it.user?.card || "",
+				uid: it.user?.uid || '',
+				name: it.user?.name || '',
+				card: it.user?.card || '',
 				timestamp: it.timestamp,
 				status: it.status,
 				verify: it.verify,
@@ -442,18 +290,18 @@ app.post("/iclock/cdata", (req, res) => {
 	}
 
 	console.log(
-		`cdata SN=${sn} items=${items.length} newest=${newest || "n/a"}`
+		`cdata SN=${sn} items=${items.length} newest=${newest || 'n/a'}`
 	);
-	res.status(200).send("OK");
+	res.status(200).send('OK');
 });
 
 // Admin/dev helpers
 
 // Pull attendance window (one shot)
 // Example: POST /api/device/pull?sn=VGU6244900359&hours=24
-app.post("/api/device/pull", (req, res) => {
+app.post('/api/device/pull', (req, res) => {
 	const sn = req.query.sn || req.query.SN;
-	if (!sn) return res.status(400).json({ error: "sn is required" });
+	if (!sn) return res.status(400).json({ error: 'sn is required' });
 
 	const lookback = Number(req.query.hours || defaultLookbackHours);
 	const now = new Date();
@@ -461,7 +309,7 @@ app.post("/api/device/pull", (req, res) => {
 	const end = now;
 
 	const cmd =
-		commandSyntax === "DATA_QUERY"
+		commandSyntax === 'DATA_QUERY'
 			? `C: DATA QUERY ATTLOG StartTime=${fmtYmdHms(
 					start
 			  )} EndTime=${fmtYmdHms(end)}`
@@ -472,11 +320,11 @@ app.post("/api/device/pull", (req, res) => {
 });
 
 // Pull full user list now (device will return USERINFO lines to /iclock/cdata)
-app.post("/api/device/pull-users", (req, res) => {
+app.post('/api/device/pull-users', (req, res) => {
 	const sn = req.query.sn || req.query.SN;
-	if (!sn) return res.status(400).json({ error: "sn is required" });
+	if (!sn) return res.status(400).json({ error: 'sn is required' });
 
-	const cmd = "C: DATA QUERY USERINFO";
+	const cmd = 'C: DATA QUERY USERINFO';
 	ensureQueue(sn).push(cmd);
 
 	const st = deviceState.get(sn) || {};
@@ -490,17 +338,17 @@ app.post("/api/device/pull-users", (req, res) => {
 });
 
 // Simplified view: attendance rows with user fields
-app.get("/api/attendances", (req, res) => {
+app.get('/api/attendances', (req, res) => {
 	const { sn } = req.query;
-	let data = pushedLogs.filter((x) => x.type === "ATTLOG");
+	let data = pushedLogs.filter((x) => x.type === 'ATTLOG');
 	if (sn) data = data.filter((x) => x.sn === sn);
 
 	const simplified = data.map((x) => ({
 		sn: x.sn,
 		pin: x.pin,
-		uid: x.user?.uid || "",
-		name: x.user?.name || "",
-		card: x.user?.card || "",
+		uid: x.user?.uid || '',
+		name: x.user?.name || '',
+		card: x.user?.card || '',
 		timestamp: x.timestamp,
 		status: x.status,
 		verify: x.verify,
@@ -511,7 +359,7 @@ app.get("/api/attendances", (req, res) => {
 });
 
 // Users collected from USERINFO
-app.get("/api/users", (req, res) => {
+app.get('/api/users', (req, res) => {
 	const sn = req.query.sn || req.query.SN;
 	if (!sn) {
 		const summary = Array.from(usersByDevice.entries()).map(([dsn, m]) => ({
@@ -524,7 +372,7 @@ app.get("/api/users", (req, res) => {
 	const users = Array.from(m.values()).map((u) => ({
 		sn,
 		pin: u.pin,
-		uid: u.uid || "",
+		uid: u.uid || '',
 		name: u.name,
 		card: u.card,
 		privilege: u.privilege,
@@ -533,7 +381,7 @@ app.get("/api/users", (req, res) => {
 	res.json({ sn, count: users.length, users });
 });
 
-app.get("/api/push/logs", (req, res) => {
+app.get('/api/push/logs', (req, res) => {
 	const { sn, type } = req.query;
 	let data = pushedLogs;
 	if (sn) data = data.filter((x) => x.sn === sn);
@@ -541,16 +389,16 @@ app.get("/api/push/logs", (req, res) => {
 	res.json({ count: data.length, logs: data });
 });
 
-app.get("/api/device/debug/queue", (req, res) => {
+app.get('/api/device/debug/queue', (req, res) => {
 	const sn = req.query.sn || req.query.SN;
-	if (!sn) return res.status(400).json({ error: "sn is required" });
+	if (!sn) return res.status(400).json({ error: 'sn is required' });
 	const q = ensureQueue(sn);
 	res.json({ sn, queued: q });
 });
 
-app.post("/api/device/add-user", (req, res) => {
+app.post('/api/device/add-user', (req, res) => {
 	const sn = req.query.sn || req.query.SN;
-	if (!sn) return res.status(400).json({ error: "sn is required" });
+	if (!sn) return res.status(400).json({ error: 'sn is required' });
 
 	// Example usage:
 	//   POST /api/device/add-user?sn=DEVICE_SN
@@ -575,29 +423,29 @@ app.post("/api/device/add-user", (req, res) => {
 		style, // 'spaces' to use spaces instead of tabs
 		uid, // optional internal user id
 	} = req.body || {};
-	if (!pin) return res.status(400).json({ error: "pin is required" });
+	if (!pin) return res.status(400).json({ error: 'pin is required' });
 
 	const clean = (v) =>
-		String(v ?? "")
-			.replace(/[\r\n]/g, " ")
+		String(v ?? '')
+			.replace(/[\r\n]/g, ' ')
 			.trim();
 
 	const pinVal = clean(pin);
-	const nameVal = clean(name || "");
-	const cardVal = clean(card || "");
+	const nameVal = clean(name || '');
+	const cardVal = clean(card || '');
 	const priVal = Number(privilege ?? 0);
-	const deptVal = clean(department || "");
-	const pwdVal = clean(password || "");
-	const pin2Val = clean(pin2 || "");
-	const grpVal = clean(group || "");
-	const uId = clean(uid || ""); // optional internal user id
+	const deptVal = clean(department || '');
+	const pwdVal = clean(password || '');
+	const pin2Val = clean(pin2 || '');
+	const grpVal = clean(group || '');
+	const uId = clean(uid || ''); // optional internal user id
 
-	// Build parts with TAB separators (some firmwares require tabs explicitly)
+	// Build parts with TAB separators (some firmware require tabs explicitly)
 	function join(parts) {
-		return style === "spaces" ? parts.join(" ") : parts.join("\t");
+		return style === 'spaces' ? parts.join(' ') : parts.join('\t');
 	}
 	const autoKey = devicePinKey.get(sn);
-	const pinLabel = (pinKey || autoKey || "PIN").trim();
+	const pinLabel = (pinKey || autoKey || 'PIN').trim();
 	const baseParts = [`${pinLabel}=${pinVal}`];
 	if (nameVal) baseParts.push(`Name=${nameVal}`);
 	baseParts.push(`Pri=${priVal}`);
@@ -658,12 +506,12 @@ app.post("/api/device/add-user", (req, res) => {
 		commands.push(`C: GET USER ${pinLabel}=${pinVal}`);
 		// Possible commit (rarely needed, harmless if ignored)
 		commands.push(`C: COMMIT USER`);
-		// Plain USER line without verb (some odd firmwares treat it as implicit SET)
+		// Plain USER line without verb (some odd firmware treat it as implicit SET)
 		const plainParts = baseParts.filter(Boolean);
 		commands.push(`C: USER ${join(plainParts)}`);
 		// Space separated variant
-		if (style !== "spaces")
-			commands.push(`C: SET USER ${plainParts.join(" ")}`);
+		if (style !== 'spaces')
+			commands.push(`C: SET USER ${plainParts.join(' ')}`);
 		// Variant with PIN first then Privilege explicitly then Name (different order)
 		const ordered = [`${pinLabel}=${pinVal}`, `Privilege=${priVal}`];
 		if (nameVal) ordered.push(`Name=${nameVal}`);
@@ -675,7 +523,7 @@ app.post("/api/device/add-user", (req, res) => {
 
 	// Full list query to force refresh
 	if (fullQuery || wantVariants) {
-		commands.push("C: DATA QUERY USER");
+		commands.push('C: DATA QUERY USER');
 	}
 
 	const q = ensureQueue(sn);
@@ -709,7 +557,7 @@ app.post("/api/device/add-user", (req, res) => {
 		card: cardVal,
 		privilege: String(priVal),
 		department: deptVal,
-		password: pwdVal ? "****" : undefined,
+		password: pwdVal ? '****' : undefined,
 		pin2: pin2Val || undefined,
 		group: grpVal || undefined,
 		updatedLocallyAt: new Date().toISOString(),
@@ -719,18 +567,18 @@ app.post("/api/device/add-user", (req, res) => {
 		ok: true,
 		enqueued: deduped,
 		queueSize: q.length,
-		note: "If user still absent: ensure USE_CRLF=1, try minimal=true&compat=true, review /iclock/cdata for USER reply, and verify device allows remote user creation.",
+		note: 'If user still absent: ensure USE_CRLF=1, try minimal=true&compat=true, review /iclock/cdata for USER reply, and verify device allows remote user creation.',
 		pinLabelUsed: pinLabel,
 		autoDetectedPinKey: autoKey || null,
 	});
 });
 
 // Delete a user (queue multiple deletion variants)
-app.post("/api/device/delete-user", (req, res) => {
+app.post('/api/device/delete-user', (req, res) => {
 	const sn = req.query.sn || req.query.SN;
-	if (!sn) return res.status(400).json({ error: "sn is required" });
+	if (!sn) return res.status(400).json({ error: 'sn is required' });
 	const { pin } = req.body || {};
-	if (!pin) return res.status(400).json({ error: "pin is required" });
+	if (!pin) return res.status(400).json({ error: 'pin is required' });
 	const variants = [
 		`C: DELETE USER PIN=${pin}`,
 		`C: DATA DELETE USER PIN=${pin}`,
@@ -751,15 +599,15 @@ app.post("/api/device/delete-user", (req, res) => {
 });
 
 // Clone an existing user (server-side) to a new PIN using stored map
-app.post("/api/device/clone-user", (req, res) => {
+app.post('/api/device/clone-user', (req, res) => {
 	const sn = req.query.sn || req.query.SN;
-	if (!sn) return res.status(400).json({ error: "sn is required" });
+	if (!sn) return res.status(400).json({ error: 'sn is required' });
 	const { fromPin, toPin, compat } = req.body || {};
 	if (!fromPin || !toPin)
-		return res.status(400).json({ error: "fromPin and toPin required" });
+		return res.status(400).json({ error: 'fromPin and toPin required' });
 	const umap = ensureUserMap(sn);
 	const src = umap.get(String(fromPin));
-	if (!src) return res.status(404).json({ error: "fromPin not found" });
+	if (!src) return res.status(404).json({ error: 'fromPin not found' });
 	// Reuse add-user logic by constructing body
 	const body = {
 		pin: String(toPin),
@@ -774,13 +622,13 @@ app.post("/api/device/clone-user", (req, res) => {
 		req,
 		res,
 		() => {},
-		"post",
-		"/api/device/add-user"
+		'post',
+		'/api/device/add-user'
 	);
 });
 
-// Toggle drip mode (one command per poll) for sensitive firmwares
-app.post("/api/device/drip-mode", (req, res) => {
+// Toggle drip mode (one command per poll) for sensitive firmware
+app.post('/api/device/drip-mode', (req, res) => {
 	const { enable } = req.body || {};
 	dripMode = !!enable;
 	console.log(`[drip-mode] set to ${dripMode}`);
@@ -788,31 +636,31 @@ app.post("/api/device/drip-mode", (req, res) => {
 });
 
 // Inspect / override detected PIN key label
-app.get("/api/device/pin-key", (req, res) => {
+app.get('/api/device/pin-key', (req, res) => {
 	const sn = req.query.sn || req.query.SN;
-	if (!sn) return res.status(400).json({ error: "sn is required" });
+	if (!sn) return res.status(400).json({ error: 'sn is required' });
 	return res.json({ sn, pinKey: devicePinKey.get(sn) || null });
 });
-app.post("/api/device/pin-key", (req, res) => {
+app.post('/api/device/pin-key', (req, res) => {
 	const sn = req.query.sn || req.query.SN;
-	if (!sn) return res.status(400).json({ error: "sn is required" });
+	if (!sn) return res.status(400).json({ error: 'sn is required' });
 	const { pinKey } = req.body || {};
-	if (!pinKey) return res.status(400).json({ error: "pinKey is required" });
+	if (!pinKey) return res.status(400).json({ error: 'pinKey is required' });
 	devicePinKey.set(sn, String(pinKey));
 	return res.json({ ok: true, sn, pinKey: devicePinKey.get(sn) });
 });
 
 // Raw command injection for advanced troubleshooting
-app.post("/api/device/enqueue-command", (req, res) => {
+app.post('/api/device/enqueue-command', (req, res) => {
 	const sn = req.query.sn || req.query.SN;
-	if (!sn) return res.status(400).json({ error: "sn is required" });
+	if (!sn) return res.status(400).json({ error: 'sn is required' });
 	const { lines } = req.body || {};
 	if (!Array.isArray(lines) || !lines.length)
-		return res.status(400).json({ error: "lines array required" });
+		return res.status(400).json({ error: 'lines array required' });
 	const q = ensureQueue(sn);
 	for (let raw of lines) {
 		raw = String(raw).trim();
-		if (!raw.startsWith("C:")) raw = `C: ${raw}`;
+		if (!raw.startsWith('C:')) raw = `C: ${raw}`;
 		q.push(raw);
 	}
 	console.log(`[enqueue-command] SN=${sn} added ${lines.length} line(s).`);
@@ -822,7 +670,7 @@ app.post("/api/device/enqueue-command", (req, res) => {
 app.listen(port, () => {
 	console.log(`Server listening on http://0.0.0.0:${port}`);
 	console.log(
-		"Device should be configured to http://<server-ip>:%d/iclock/",
+		'Device should be configured to http://<server-ip>:%d/iclock/',
 		port
 	);
 	console.log(`pullMode=${pullMode} commandSyntax=${commandSyntax}`);
