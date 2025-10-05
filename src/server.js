@@ -304,11 +304,12 @@ app.get("/iclock/getrequest", (req, res) => {
 	deviceState.set(sn, state);
 
 	// Debug: log each poll (can be noisy; comment out if too verbose)
-	console.log(
-		`[getrequest] poll SN=${sn} pullMode=${pullMode} queued=${
-			ensureQueue(sn).length
-		}`
-	);
+	if (ensureQueue(sn).length > 0)
+		console.log(
+			`[getrequest] poll SN=${sn} pullMode=${pullMode} queued=${
+				ensureQueue(sn).length
+			}`
+		);
 
 	const queue = ensureQueue(sn);
 	maybeQueueUserSync(sn);
@@ -323,15 +324,17 @@ app.get("/iclock/getrequest", (req, res) => {
 			queue.length = 0;
 		}
 		const body = cmds.join(sep) + sep;
+		console.log(cmds);
 		console.log(
 			`*[getrequest] SN=${sn} sending ${cmds.length} cmd(s) dripMode=${dripMode}`
 		); // concise log
+		console.log(body);
 		return res.status(200).send(body);
 	}
 	if (pullMode) {
 		const cmd = buildFetchCommand(sn);
 		const sep = USE_CRLF ? "\r\n" : "\n";
-		console.log(`[getrequest] SN=${sn} auto cmd: ${cmd}`);
+		// console.log(`[getrequest] SN=${sn} auto cmd: ${cmd}`);
 		return res.status(200).send(cmd + sep);
 	}
 	console.log(`[getrequest] SN=${sn} idle (no commands, pullMode=false)`);
@@ -570,6 +573,7 @@ app.post("/api/device/add-user", (req, res) => {
 		pinKey, // override PIN field label (e.g. Badgenumber, EnrollNumber)
 		single, // if true send only the base command
 		style, // 'spaces' to use spaces instead of tabs
+		uid, // optional internal user id
 	} = req.body || {};
 	if (!pin) return res.status(400).json({ error: "pin is required" });
 
@@ -586,6 +590,7 @@ app.post("/api/device/add-user", (req, res) => {
 	const pwdVal = clean(password || "");
 	const pin2Val = clean(pin2 || "");
 	const grpVal = clean(group || "");
+	const uId = clean(uid || ""); // optional internal user id
 
 	// Build parts with TAB separators (some firmwares require tabs explicitly)
 	function join(parts) {
@@ -601,6 +606,7 @@ app.post("/api/device/add-user", (req, res) => {
 	if (!minimal && pwdVal) baseParts.push(`Passwd=${pwdVal}`);
 	if (!minimal && pin2Val) baseParts.push(`PIN2=${pin2Val}`);
 	if (!minimal && grpVal) baseParts.push(`Grp=${grpVal}`);
+	if (!minimal && uId) baseParts.push(`UID=${uId}`); // internal id, not standard
 
 	const base = `C: SET USERINFO ${join(baseParts)}`;
 	const commands = [base];
@@ -616,6 +622,7 @@ app.post("/api/device/add-user", (req, res) => {
 			`C: SET USERINFO ${join([
 				`${pinLabel}=${pinVal}`,
 				`Pri=${priVal}`,
+				`UID=${uId}`,
 			])}`
 		);
 		// Privilege= variant
@@ -645,30 +652,30 @@ app.post("/api/device/add-user", (req, res) => {
 				nameVal ? `Name=${nameVal}` : null,
 				`Pri=${priVal}`,
 			].filter(Boolean);
-			commands.push(`C: SET USERINFO ${join(reorder)}`);
+			commands.push(`C: SET USER ${join(reorder)}`);
 		}
 		// GET single user
-		commands.push(`C: GET USERINFO ${pinLabel}=${pinVal}`);
+		commands.push(`C: GET USER ${pinLabel}=${pinVal}`);
 		// Possible commit (rarely needed, harmless if ignored)
-		commands.push(`C: COMMIT USERINFO`);
-		// Plain USERINFO line without verb (some odd firmwares treat it as implicit SET)
+		commands.push(`C: COMMIT USER`);
+		// Plain USER line without verb (some odd firmwares treat it as implicit SET)
 		const plainParts = baseParts.filter(Boolean);
-		commands.push(`C: USERINFO ${join(plainParts)}`);
+		commands.push(`C: USER ${join(plainParts)}`);
 		// Space separated variant
 		if (style !== "spaces")
-			commands.push(`C: SET USERINFO ${plainParts.join(" ")}`);
+			commands.push(`C: SET USER ${plainParts.join(" ")}`);
 		// Variant with PIN first then Privilege explicitly then Name (different order)
 		const ordered = [`${pinLabel}=${pinVal}`, `Privilege=${priVal}`];
 		if (nameVal) ordered.push(`Name=${nameVal}`);
-		commands.push(`C: SET USERINFO ${join(ordered)}`);
+		commands.push(`C: SET USER ${join(ordered)}`);
 	}
 
 	// Query that PIN (may be ignored, harmless if unsupported)
-	commands.push(`C: DATA QUERY USERINFO ${pinLabel}=${pinVal}`);
+	commands.push(`C: DATA QUERY USER ${pinLabel}=${pinVal}`);
 
 	// Full list query to force refresh
 	if (fullQuery || wantVariants) {
-		commands.push("C: DATA QUERY USERINFO");
+		commands.push("C: DATA QUERY USER");
 	}
 
 	const q = ensureQueue(sn);
@@ -712,7 +719,7 @@ app.post("/api/device/add-user", (req, res) => {
 		ok: true,
 		enqueued: deduped,
 		queueSize: q.length,
-		note: "If user still absent: ensure USE_CRLF=1, try minimal=true&compat=true, review /iclock/cdata for USERINFO reply, and verify device allows remote user creation.",
+		note: "If user still absent: ensure USE_CRLF=1, try minimal=true&compat=true, review /iclock/cdata for USER reply, and verify device allows remote user creation.",
 		pinLabelUsed: pinLabel,
 		autoDetectedPinKey: autoKey || null,
 	});
@@ -725,12 +732,12 @@ app.post("/api/device/delete-user", (req, res) => {
 	const { pin } = req.body || {};
 	if (!pin) return res.status(400).json({ error: "pin is required" });
 	const variants = [
-		`C: DELETE USERINFO PIN=${pin}`,
-		`C: DATA DELETE USERINFO PIN=${pin}`,
+		`C: DELETE USER PIN=${pin}`,
+		`C: DATA DELETE USER PIN=${pin}`,
 		`C: CLEAR USER PIN=${pin}`,
 		`C: REMOVE USER PIN=${pin}`,
-		`C: GET USERINFO PIN=${pin}`,
-		`C: DATA QUERY USERINFO PIN=${pin}`,
+		`C: GET USER PIN=${pin}`,
+		`C: DATA QUERY USER PIN=${pin}`,
 	];
 	const q = ensureQueue(sn);
 	variants.forEach((v) => q.push(v));
