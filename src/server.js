@@ -20,6 +20,10 @@ const commandQueue = new Map(); // sn -> [ 'C: ...' ]
 const usersByDevice = new Map(); // sn -> Map(pin -> user)
 const devicePinKey = new Map(); // sn -> preferred PIN field key (PIN, Badgenumber, EnrollNumber, etc.)
 const sseClients = new Set(); // SSE clients for real-time
+const sentCommands = new Map(); // sn -> [{ id, cmd, queuedAt, sentAt(deprecated), deliveredAt, bytesSent, respondedAt, staleAt, postSeenAfterDelivery, remote }]
+const cdataEvents = new Map(); // sn -> [{ at, lineCount, firstLine, hasUserInfo, hasAttlog, hasOptionLike }]
+const rawCDataStore = new Map(); // sn -> [{ at, raw, bytes }]
+const pollHistory = new Map(); // sn -> [{ at, queueBefore, deliveredCount, remote }]
 // NOTE: Optimistic creation: we tag locally created (not yet confirmed) users with optimistic=true
 // When a real USERINFO for that PIN arrives, we remove the optimistic flag and stamp confirmedAt
 
@@ -40,6 +44,90 @@ function ensureQueue(sn) {
 function ensureUserMap(sn) {
   if (!usersByDevice.has(sn)) usersByDevice.set(sn, new Map());
   return usersByDevice.get(sn);
+}
+function ensureSentList(sn) {
+  if (!sentCommands.has(sn)) sentCommands.set(sn, []);
+  return sentCommands.get(sn);
+}
+
+let globalCommandId = 1;
+function recordSentCommand(sn, cmd, remote) {
+  const list = ensureSentList(sn);
+  list.push({
+    id: globalCommandId++,
+    cmd,
+    queuedAt: new Date().toISOString(), // new canonical field
+    sentAt: new Date().toISOString(), // legacy name retained for compatibility
+    deliveredAt: null,
+    bytesSent: null,
+    respondedAt: null,
+    staleAt: null,
+    remote: remote || null,
+  });
+  // Cap list length to avoid unbounded growth
+  if (list.length > 500) list.splice(0, list.length - 500);
+}
+function markDelivered(sn, ids, bytes) {
+  const list = sentCommands.get(sn);
+  if (!list) return;
+  const ts = new Date().toISOString();
+  for (const rec of list) {
+    if (ids.includes(rec.id)) {
+      rec.deliveredAt = ts;
+      rec.bytesSent = bytes;
+    }
+  }
+}
+function markResponse(sn, matcherFn) {
+  const list = sentCommands.get(sn);
+  if (!list) return;
+  const now = new Date().toISOString();
+  for (const rec of list) {
+    if (!rec.respondedAt && matcherFn(rec.cmd)) {
+      rec.respondedAt = now;
+    }
+  }
+}
+function recordCDataEvent(sn, summary) {
+  if (!cdataEvents.has(sn)) cdataEvents.set(sn, []);
+  const arr = cdataEvents.get(sn);
+  arr.push(summary);
+  if (arr.length > 300) arr.splice(0, arr.length - 300);
+  // Update linkage: any command delivered before this event but not yet responded gets postSeenAfterDelivery
+  const cmds = sentCommands.get(sn);
+  if (cmds) {
+    for (const c of cmds) {
+      if (c.deliveredAt && !c.respondedAt) {
+        if (!c.postSeenAfterDelivery && c.deliveredAt <= summary.at) {
+          c.postSeenAfterDelivery = true;
+        }
+      }
+    }
+  }
+}
+
+// Poll history record
+function recordPoll(sn, remote, queueBefore, deliveredCount) {
+  if (!pollHistory.has(sn)) pollHistory.set(sn, []);
+  const arr = pollHistory.get(sn);
+  arr.push({ at: new Date().toISOString(), remote, queueBefore, deliveredCount });
+  if (arr.length > 200) arr.splice(0, arr.length - 200);
+}
+
+// Stale detection (commands delivered but no response after threshold)
+const STALE_SECONDS = Number(process.env.STALE_SECONDS || 90);
+function markStaleCommands(sn) {
+  const list = sentCommands.get(sn);
+  if (!list) return;
+  const now = Date.now();
+  for (const c of list) {
+    if (c.deliveredAt && !c.respondedAt && !c.staleAt) {
+      const age = now - new Date(c.deliveredAt).getTime();
+      if (age > STALE_SECONDS * 1000) {
+        c.staleAt = new Date().toISOString();
+      }
+    }
+  }
 }
 
 function buildFetchCommand(sn) {
@@ -185,15 +273,35 @@ app.get('/iclock/getrequest', (req, res) => {
     console.log(cmds);
     console.log(`*[getrequest] SN=${sn} sending ${cmds.length} cmd(s) dripMode=${dripMode}`); // concise log
     console.log(body);
-    return res.status(200).send(body);
+    // Record commands (pre-write) for diagnostics
+    const remote = (req.socket && req.socket.remoteAddress) || null;
+
+    const justIds = [];
+    cmds.forEach((c) => {
+      recordSentCommand(sn, c, remote);
+      const list = sentCommands.get(sn);
+      console.log(`list`, list);
+      if (list) justIds.push(list[list.length - 1].id);
+    });
+    console.log(`body`, body);
+    // Attempt send
+    res.status(200).send(body);
+    // Approximate bytes (body length in UTF-8)
+    const bytes = Buffer.byteLength(body, 'utf8');
+    markDelivered(sn, justIds, bytes);
+    recordPoll(sn, remote, queue.length + cmds.length, cmds.length);
+    markStaleCommands(sn);
+    return; // response already sent
   }
   if (pullMode) {
     const cmd = buildFetchCommand(sn);
     const sep = USE_CRLF ? '\r\n' : '\n';
     // console.log(`[getrequest] SN=${sn} auto cmd: ${cmd}`);
+    recordPoll(sn, (req.socket && req.socket.remoteAddress) || null, queue.length, 0);
     return res.status(200).send(cmd + sep);
   }
   console.log(`[getrequest] SN=${sn} idle (no commands, pullMode=false)`);
+  recordPoll(sn, (req.socket && req.socket.remoteAddress) || null, queue.length, 0);
   return res.status(200).send('');
 });
 
@@ -213,6 +321,39 @@ app.post('/iclock/cdata', (req, res) => {
       String(raw)
     )} firstLine=${rawLines[0] ? JSON.stringify(rawLines[0]) : '<empty>'}`
   );
+
+  // Heuristic: if we receive USERINFO lines, mark any outstanding USER related commands as responded
+  const hasUserInfo = rawLines.some((l) => /^USERINFO\b/i.test(l));
+  if (hasUserInfo) {
+    markResponse(sn, (cmd) => /USERINFO|DATA QUERY USER|GET USER/gi.test(cmd));
+  }
+  // If we see ATTLOG lines, mark fetch attendance commands responded
+  const hasAtt = rawLines.some((l) => /^ATTLOG\b/i.test(l));
+  if (hasAtt) {
+    markResponse(sn, (cmd) => /ATTLOG/gi.test(cmd));
+  }
+  // Option-like (very heuristic) lines: contain '=' and maybe known keywords
+  const hasOptionLike = rawLines.some(
+    (l) =>
+      /^(INFO|PLATFORM|FIRMWARE|SERIAL)/i.test(l) ||
+      (/=/.test(l) && /^GET OPTION/i.test(l) === false && !/^ATTLOG|USERINFO/i.test(l))
+  );
+
+  recordCDataEvent(sn, {
+    at: new Date().toISOString(),
+    lineCount: rawLines.length,
+    firstLine: rawLines[0] || '',
+    hasUserInfo: !!hasUserInfo,
+    hasAttlog: !!hasAtt,
+    hasOptionLike: !!hasOptionLike,
+  });
+  // Store raw body (truncated if huge)
+  const truncated = rawLines.slice(0, 200).join('\n');
+  if (!rawCDataStore.has(sn)) rawCDataStore.set(sn, []);
+  const rawArr = rawCDataStore.get(sn);
+  rawArr.push({ at: new Date().toISOString(), raw: truncated, bytes: Buffer.byteLength(raw) });
+  if (rawArr.length > 100) rawArr.splice(0, rawArr.length - 100);
+  markStaleCommands(sn);
 
   const items = parseCData(raw).map((e) => ({
     ...e,
@@ -602,6 +743,111 @@ app.post('/api/device/add-user', (req, res) => {
   });
 });
 
+// Diagnostics: list sent commands & their response status
+app.get('/api/device/commands', (req, res) => {
+  const sn = req.query.sn || req.query.SN;
+  if (!sn) return res.status(400).json({ error: 'sn is required' });
+  const list = ensureSentList(sn).slice(-200); // last 200
+  // Derive quick stats
+  const pending = list.filter((c) => c.deliveredAt && !c.respondedAt);
+  const pendingNoPostAfter = pending.filter((c) => !c.postSeenAfterDelivery).length;
+  const pendingWithPost = pending.filter((c) => c.postSeenAfterDelivery).length;
+  const stale = list.filter((c) => c.staleAt && !c.respondedAt).length;
+  res.json({
+    sn,
+    count: list.length,
+    commands: list,
+    stats: {
+      pending: pending.length,
+      pendingNoPostAfter,
+      pendingWithPostButNoMatch: pendingWithPost,
+      stale,
+      staleSecondsThreshold: STALE_SECONDS,
+    },
+  });
+});
+
+// Clear diagnostics history for a device
+app.post('/api/device/commands/clear', (req, res) => {
+  const sn = req.query.sn || req.query.SN;
+  if (!sn) return res.status(400).json({ error: 'sn is required' });
+  sentCommands.set(sn, []);
+  cdataEvents.set(sn, []);
+  rawCDataStore.set(sn, []);
+  pollHistory.set(sn, []);
+  res.json({ ok: true, sn });
+});
+
+// Force re-sync of users: clears lastUserSyncAt & queues a fresh query (optionally clears optimistic flags)
+app.post('/api/device/force-user-sync', (req, res) => {
+  const sn = req.query.sn || req.query.SN;
+  if (!sn) return res.status(400).json({ error: 'sn is required' });
+  const { clearOptimistic } = req.body || {};
+  const st = deviceState.get(sn) || {};
+  delete st.lastUserSyncAt;
+  deviceState.set(sn, st);
+  ensureQueue(sn).push('C: DATA QUERY USERINFO');
+  if (clearOptimistic) {
+    const umap = usersByDevice.get(sn);
+    if (umap) {
+      for (const [pin, u] of umap.entries()) {
+        if (u.optimistic) umap.delete(pin);
+      }
+    }
+  }
+  res.json({ ok: true, queued: 'DATA QUERY USERINFO', clearOptimistic: !!clearOptimistic });
+});
+
+// Inspect recent raw cdata event summaries
+app.get('/api/device/cdata-events', (req, res) => {
+  const sn = req.query.sn || req.query.SN;
+  if (!sn) return res.status(400).json({ error: 'sn is required' });
+  const events = (cdataEvents.get(sn) || []).slice(-100);
+  res.json({ sn, count: events.length, events });
+});
+
+// Raw cdata bodies (recent)
+app.get('/api/device/raw-cdata', (req, res) => {
+  const sn = req.query.sn || req.query.SN;
+  if (!sn) return res.status(400).json({ error: 'sn is required' });
+  const arr = (rawCDataStore.get(sn) || []).slice(-50);
+  res.json({ sn, count: arr.length, items: arr });
+});
+
+// Poll history
+app.get('/api/device/polls', (req, res) => {
+  const sn = req.query.sn || req.query.SN;
+  if (!sn) return res.status(400).json({ error: 'sn is required' });
+  const arr = (pollHistory.get(sn) || []).slice(-100);
+  res.json({ sn, count: arr.length, polls: arr });
+});
+
+// Force stale re-evaluation & optionally enqueue fallback legacy variants (without C:) if nothing responded
+app.post('/api/device/diagnose', (req, res) => {
+  const sn = req.query.sn || req.query.SN;
+  if (!sn) return res.status(400).json({ error: 'sn is required' });
+  const { enqueueFallback } = req.body || {};
+  markStaleCommands(sn);
+  let enqueued = [];
+  if (enqueueFallback) {
+    const list = sentCommands.get(sn) || [];
+    const hasAnyUserReply = (cdataEvents.get(sn) || []).some((e) => e.hasUserInfo);
+    if (!hasAnyUserReply) {
+      const fallback = [
+        'DATA QUERY USERINFO',
+        'GET USERINFO',
+        'DATA QUERY USER',
+        'GET USER',
+        'GET OPTION INFO',
+      ];
+      const q = ensureQueue(sn);
+      fallback.forEach((f) => q.push(f.startsWith('C:') ? f : `C: ${f}`));
+      enqueued = fallback;
+    }
+  }
+  res.json({ ok: true, enqueued, staleSecondsThreshold: STALE_SECONDS });
+});
+
 // Quick test helper (optional)
 app.post('/api/device/add-user/test', (req, res) => {
   const sn = req.query.sn || req.query.SN;
@@ -734,6 +980,49 @@ app.post('/api/device/custom-command', (req, res) => {
   q.push(cmd);
   console.log(`[custom-command] SN=${sn} queued:\n  > ${cmd}`);
   res.json({ ok: true, enqueued: [cmd], queueSize: q.length });
+});
+
+// Diagnostic probe: enqueue a suite of commands that should, if supported, elicit responses.
+// Optional body: { pin: '123', minutes: 10 }
+app.post('/api/device/probe', (req, res) => {
+  const sn = req.query.sn || req.query.SN;
+  if (!sn) return res.status(400).json({ error: 'sn is required' });
+  const { pin, minutes = 10 } = req.body || {};
+  const lookback = Math.min(Math.max(Number(minutes) || 1, 1), 1440); // clamp 1..1440
+  const now = new Date();
+  const start = new Date(now.getTime() - lookback * 60 * 1000);
+  const startStr = fmtYmdHms(start);
+  const endStr = fmtYmdHms(now);
+  const q = ensureQueue(sn);
+  const cmds = [
+    // Attendance queries
+    `C: DATA QUERY ATTLOG StartTime=${startStr} EndTime=${endStr}`,
+    `C: GET ATTLOG StartTime=${startStr} EndTime=${endStr}`,
+    'C: ATTLOG',
+    // User list queries
+    'C: DATA QUERY USERINFO',
+    'C: GET USERINFO',
+    'C: DATA QUERY USER',
+    // Option queries (some firmwares respond with OPTION lines)
+    'C: GET OPTION DATE',
+    'C: GET OPTION INFO',
+    'C: GET OPTION PLATFORM',
+  ];
+  if (pin) {
+    cmds.push(`C: GET USER PIN=${pin}`);
+    cmds.push(`C: DATA QUERY USER PIN=${pin}`);
+  }
+  // Deduplicate
+  const seen = new Set();
+  const deduped = [];
+  for (const c of cmds) {
+    if (seen.has(c)) continue;
+    seen.add(c);
+    deduped.push(c);
+  }
+  deduped.forEach((c) => q.push(c));
+  console.log(`[probe] SN=${sn} queued ${deduped.length} diagnostic command(s).`);
+  res.json({ ok: true, enqueued: deduped, queueSize: q.length, windowMinutes: lookback });
 });
 
 app.listen(port, () => {
