@@ -122,10 +122,11 @@ function parseCData(raw) {
         entries.push(parseUserInfo(fields));
         break;
       default:
-        if (fields.length >= 2 && looksLikeYmdHms(fields[1]))
+        if (fields.length >= 2 && looksLikeYmdHms(fields[1])) {
           entries.push(parseATTLOG(fields, 'plain'));
-
-        entries.push({ type: 'UNKNOWN', raw: line });
+        } else {
+          entries.push({ type: 'UNKNOWN', raw: line });
+        }
         break;
     }
   }

@@ -150,6 +150,9 @@ app.get('/iclock/ping', (req, res) => {
 
   deviceState.set(sn, state);
 
+  console.log(`[ping] SN=${sn}`);
+  console.log(state, 'deviceState');
+
   res.status(200).send('OK');
 });
 
