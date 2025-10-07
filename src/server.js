@@ -16,7 +16,7 @@ app.use('/iclock', express.text({ type: '*/*', limit: '10mb' }));
 // In-memory stores (replace with DB in prod)
 const pushedLogs = []; // raw + enriched entries
 const deviceState = new Map(); // sn -> { lastStamp, lastSeenAt, lastUserSyncAt }
-const commandQueue = new Map(); // sn -> [ 'C: ...' ]
+const commandQueue = new Map(); // sn -> [ '...' ]
 const usersByDevice = new Map(); // sn -> Map(pin -> user)
 const devicePinKey = new Map(); // sn -> preferred PIN field key (PIN, Badgenumber, EnrollNumber, etc.)
 const sseClients = new Set(); // SSE clients for real-time
@@ -161,13 +161,13 @@ function buildFetchCommand(sn) {
 
   switch (commandSyntax) {
     case 'DATA_QUERY':
-      return `C: DATA QUERY ATTLOG StartTime=${start} EndTime=${end}`;
+      return `DATA QUERY ATTLOG StartTime=${start} EndTime=${end}`;
     case 'GET_ATTLOG':
-      return `C: GET ATTLOG StartTime=${start} EndTime=${end}`;
+      return `GET ATTLOG StartTime=${start} EndTime=${end}`;
     case 'ATTLOG':
-      return `C: ATTLOG`;
+      return `ATTLOG`;
     default:
-      return `C: DATA QUERY ATTLOG StartTime=${start} EndTime=${end}`;
+      return `DATA QUERY ATTLOG StartTime=${start} EndTime=${end}`;
   }
 }
 
@@ -178,7 +178,7 @@ function maybeQueueUserSync(sn) {
   const now = new Date();
   const stale = !last || now.getTime() - last.getTime() > 6 * 3600 * 1000; // 6h
   if (stale) {
-    ensureQueue(sn).push('C: DATA QUERY USERINFO');
+    ensureQueue(sn).push('DATA QUERY USERINFO');
     st.lastUserSyncAt = now.toISOString();
     deviceState.set(sn, st);
   }
@@ -458,7 +458,7 @@ app.post('/api/device/pull', (req, res) => {
 
   const cmd =
     commandSyntax === 'DATA_QUERY'
-      ? `C: DATA QUERY ATTLOG StartTime=${fmtYmdHms(start)} EndTime=${fmtYmdHms(end)}`
+      ? `DATA QUERY ATTLOG StartTime=${fmtYmdHms(start)} EndTime=${fmtYmdHms(end)}`
       : buildFetchCommand(sn);
 
   ensureQueue(sn).push(cmd);
@@ -470,7 +470,7 @@ app.post('/api/device/pull-users', (req, res) => {
   const sn = req.query.sn || req.query.SN;
   if (!sn) return res.status(400).json({ error: 'sn is required' });
 
-  const cmd = 'C: DATA QUERY USERINFO';
+  const cmd = 'DATA QUERY USERINFO';
   ensureQueue(sn).push(cmd);
 
   const st = deviceState.get(sn) || {};
@@ -604,7 +604,7 @@ app.post('/api/device/add-user', (req, res) => {
   if (!minimal && grpVal) baseParts.push(`Grp=${grpVal}`);
   if (!minimal && uId) baseParts.push(`UID=${uId}`); // internal id, not standard
 
-  const base = `C: SET USERINFO ${join(baseParts)}`;
+  const base = `SET USERINFO ${join(baseParts)}`;
   const commands = [base];
 
   let wantVariants = !!(sendVariants || compat);
@@ -612,19 +612,17 @@ app.post('/api/device/add-user', (req, res) => {
   if (wantVariants) {
     // DATA UPDATE variant (with tabs)
     const updateParts = baseParts.filter(Boolean);
-    commands.push(`C: DATA UPDATE USERINFO ${join(updateParts)}`);
+    commands.push(`DATA UPDATE USERINFO ${join(updateParts)}`);
     // Minimal SET (only PIN + Pri)
     commands.push(
-      `C: SET USERINFO ${join([
+      `SET USERINFO ${join([
         `User Id=${pinVal}`,
         `Name=${nameVal}`,
         `UserRole=${priVal}`,
         `UID=${uId}`,
       ])}`
     );
-    commands.push(
-      `C: SET USERINFO ${join([`${pinLabel}=${pinVal}`, `Pri=${priVal}`, `UID=${uId}`])}`
-    );
+    commands.push(`SET USERINFO ${join([`${pinLabel}=${pinVal}`, `Pri=${priVal}`, `UID=${uId}`])}`);
     // Privilege= variant
     const privParts = [
       `${pinLabel}=${pinVal}`,
@@ -634,7 +632,7 @@ app.post('/api/device/add-user', (req, res) => {
       deptVal ? `Dept=${deptVal}` : null,
       uId ? `UID=${uId}` : null,
     ].filter(Boolean);
-    commands.push(`C: SET USERINFO ${join(privParts)}`);
+    commands.push(`SET USERINFO ${join(privParts)}`);
     // CardNo variant
     if (cardVal) {
       const cardNoParts = [
@@ -644,7 +642,7 @@ app.post('/api/device/add-user', (req, res) => {
         `CardNo=${cardVal}`,
         uId ? `UID=${uId}` : null,
       ].filter(Boolean);
-      commands.push(`C: SET USERINFO ${join(cardNoParts)}`);
+      commands.push(`SET USERINFO ${join(cardNoParts)}`);
     }
     // Reordered variant (Card then Name) - some devices care about order
     if (cardVal) {
@@ -655,30 +653,30 @@ app.post('/api/device/add-user', (req, res) => {
         `Pri=${priVal}`,
         uId ? `UID=${uId}` : null,
       ].filter(Boolean);
-      commands.push(`C: SET USER ${join(reorder)}`);
+      commands.push(`SET USER ${join(reorder)}`);
     }
     // GET single user
-    commands.push(`C: GET USER ${pinLabel}=${pinVal}`);
-    commands.push(`C: GET USER ${uIdLabel}=${uId}`);
+    commands.push(`GET USER ${pinLabel}=${pinVal}`);
+    commands.push(`GET USER ${uIdLabel}=${uId}`);
     // Possible commit (rarely needed, harmless if ignored)
-    commands.push(`C: COMMIT USER`);
+    commands.push(`COMMIT USER`);
     // Plain USER line without verb (some odd firmware treat it as implicit SET)
     const plainParts = baseParts.filter(Boolean);
-    commands.push(`C: USER ${join(plainParts)}`);
+    commands.push(`USER ${join(plainParts)}`);
     // Space separated variant
-    if (style !== 'spaces') commands.push(`C: SET USER ${plainParts.join(' ')}`);
+    if (style !== 'spaces') commands.push(`SET USER ${plainParts.join(' ')}`);
     // Variant with PIN first then Privilege explicitly then Name (different order)
     const ordered = [`${pinLabel}=${pinVal}`, `Privilege=${priVal}`];
     if (nameVal) ordered.push(`Name=${nameVal}`);
-    commands.push(`C: SET USER ${join(ordered)}`);
+    commands.push(`SET USER ${join(ordered)}`);
   }
 
   // Query that PIN (may be ignored, harmless if unsupported)
-  commands.push(`C: DATA QUERY USER ${pinLabel}=${pinVal}`);
+  commands.push(`DATA QUERY USER ${pinLabel}=${pinVal}`);
 
   // Full list query to force refresh
   if (fullQuery || wantVariants) {
-    commands.push('C: DATA QUERY USER');
+    commands.push('DATA QUERY USER');
   }
 
   const q = ensureQueue(sn);
@@ -786,7 +784,7 @@ app.post('/api/device/force-user-sync', (req, res) => {
   const st = deviceState.get(sn) || {};
   delete st.lastUserSyncAt;
   deviceState.set(sn, st);
-  ensureQueue(sn).push('C: DATA QUERY USERINFO');
+  ensureQueue(sn).push('DATA QUERY USERINFO');
   if (clearOptimistic) {
     const umap = usersByDevice.get(sn);
     if (umap) {
@@ -841,7 +839,7 @@ app.post('/api/device/diagnose', (req, res) => {
         'GET OPTION INFO',
       ];
       const q = ensureQueue(sn);
-      fallback.forEach((f) => q.push(f.startsWith('C:') ? f : `C: ${f}`));
+      fallback.forEach((f) => q.push(f.startsWith('C:') ? f : `${f}`));
       enqueued = fallback;
     }
   }
@@ -871,12 +869,12 @@ app.post('/api/device/delete-user', (req, res) => {
   const { pin } = req.body || {};
   if (!pin) return res.status(400).json({ error: 'pin is required' });
   const variants = [
-    `C: DELETE USER PIN=${pin}`,
-    `C: DATA DELETE USER PIN=${pin}`,
-    `C: CLEAR USER PIN=${pin}`,
-    `C: REMOVE USER PIN=${pin}`,
-    `C: GET USER PIN=${pin}`,
-    `C: DATA QUERY USER PIN=${pin}`,
+    `DELETE USER PIN=${pin}`,
+    `DATA DELETE USER PIN=${pin}`,
+    `CLEAR USER PIN=${pin}`,
+    `REMOVE USER PIN=${pin}`,
+    `GET USER PIN=${pin}`,
+    `DATA QUERY USER PIN=${pin}`,
   ];
   const q = ensureQueue(sn);
   variants.forEach((v) => q.push(v));
@@ -942,7 +940,7 @@ app.post('/api/device/enqueue-command', (req, res) => {
   const q = ensureQueue(sn);
   for (let raw of lines) {
     raw = String(raw).trim();
-    if (!raw.startsWith('C:')) raw = `C: ${raw}`;
+    if (!raw.startsWith('C:')) raw = `${raw}`;
     q.push(raw);
   }
   console.log(`[enqueue-command] SN=${sn} added ${lines.length} line(s).`);
@@ -959,12 +957,12 @@ app.post('/api/device/add-user-minimal', (req, res) => {
   const nameVal = (name || '').replace(/[\r\n]/g, ' ').trim();
   const cardVal = (card || pinVal).trim();
 
-  const cmd = `C: SET USERINFO PIN=${pinVal}${
+  const cmd = `SET USERINFO PIN=${pinVal}${
     nameVal ? ` Name=${nameVal}` : ''
   } Privilege=${privilege} Card=${cardVal}`;
   const q = ensureQueue(sn);
   q.push(cmd);
-  q.push('C: DATA QUERY USERINFO'); // full list to confirm
+  q.push('DATA QUERY USERINFO'); // full list to confirm
   console.log(`[add-user-minimal] SN=${sn} queued:\n  > ${cmd}`);
   res.json({ ok: true, enqueued: [cmd], queueSize: q.length });
 });
@@ -975,7 +973,7 @@ app.post('/api/device/custom-command', (req, res) => {
   const { command } = req.body || {};
   if (!command) return res.status(400).json({ error: 'command is required' });
   let cmd = String(command).trim();
-  if (!cmd.startsWith('C:')) cmd = `C: ${cmd}`;
+  if (!cmd.startsWith('C:')) cmd = `${cmd}`;
   const q = ensureQueue(sn);
   q.push(cmd);
   console.log(`[custom-command] SN=${sn} queued:\n  > ${cmd}`);
@@ -996,21 +994,21 @@ app.post('/api/device/probe', (req, res) => {
   const q = ensureQueue(sn);
   const cmds = [
     // Attendance queries
-    `C: DATA QUERY ATTLOG StartTime=${startStr} EndTime=${endStr}`,
-    `C: GET ATTLOG StartTime=${startStr} EndTime=${endStr}`,
-    'C: ATTLOG',
+    `DATA QUERY ATTLOG StartTime=${startStr} EndTime=${endStr}`,
+    `GET ATTLOG StartTime=${startStr} EndTime=${endStr}`,
+    'ATTLOG',
     // User list queries
-    'C: DATA QUERY USERINFO',
-    'C: GET USERINFO',
-    'C: DATA QUERY USER',
+    'DATA QUERY USERINFO',
+    'GET USERINFO',
+    'DATA QUERY USER',
     // Option queries (some firmwares respond with OPTION lines)
-    'C: GET OPTION DATE',
-    'C: GET OPTION INFO',
-    'C: GET OPTION PLATFORM',
+    'GET OPTION DATE',
+    'GET OPTION INFO',
+    'GET OPTION PLATFORM',
   ];
   if (pin) {
-    cmds.push(`C: GET USER PIN=${pin}`);
-    cmds.push(`C: DATA QUERY USER PIN=${pin}`);
+    cmds.push(`GET USER PIN=${pin}`);
+    cmds.push(`DATA QUERY USER PIN=${pin}`);
   }
   // Deduplicate
   const seen = new Set();
