@@ -1,4 +1,4 @@
-const { parseISO, isValid, formatISO, format } = require('date-fns');
+const { parseISO, isValid, format } = require('date-fns');
 
 // Map verify codes to method (adjust if your firmware differs)
 const CODE_TO_METHOD = {
@@ -17,7 +17,7 @@ const CODE_TO_METHOD = {
   12: 'face+fingerprint',
   13: 'face+fingerprint+password',
   14: 'face+fingerprint+card',
-  15: 'face+fingerprint+card+password',
+  15: 'face',
 };
 
 function verifyCodeToMethod(code) {
@@ -83,9 +83,24 @@ function maxTimestampYmdHms(items) {
   return maxDate ? fmtYmdHms(maxDate) : null;
 }
 
+function kvPairs(s) {
+  // split on tabs, then key=value
+  const obj = {};
+  s.split('\t').forEach((seg) => {
+    if (!seg) return;
+    const eq = seg.indexOf('=');
+    if (eq === -1) return;
+    const key = seg.substring(0, eq).trim();
+    const val = seg.substring(eq + 1).trim();
+    obj[key] = val;
+  });
+  return obj;
+}
+
 module.exports = {
   verifyCodeToMethod,
   fmtYmdHms,
   toISO,
   maxTimestampYmdHms,
+  kvPairs,
 };

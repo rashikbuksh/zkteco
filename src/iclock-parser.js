@@ -1,45 +1,14 @@
-const { parseISO, isValid, formatISO } = require('date-fns');
-
-function splitLines(raw) {
-  return String(raw)
-    .replace(/\r/g, '\n')
-    .split('\n')
-    .map((l) => l.trim())
-    .filter(Boolean);
-}
-
-function SPLITTING(data, delimiters) {
-  return data.split(delimiters).map((x) => x.trim());
-}
-
-function splitFields(line) {
-  if (line.includes(',')) return SPLITTING(line, ',');
-
-  if (line.includes('\t')) return SPLITTING(line, '\t');
-
-  return SPLITTING(line.replace(/\s+/g, ' '), ' ');
-}
-
-function looksLikeYmdHms(s) {
-  return /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}$/.test(String(s));
-}
-
-function toISO(ts) {
-  if (!ts) return ts;
-  if (!isValid(parseISO(ts))) return ts;
-
-  return formatISO(ts);
-}
+const { verifyCodeToMethod, kvPairs } = require('./utils');
 
 function parseATTLOG(fields, type) {
   // Tagged format: "ATTLOG PIN TIMESTAMP STATUS VERIFY WORKCODE ..."
   if (type === 'tagged')
     return {
-      type: 'ATTLOG',
+      type: 'REAL_TIME_LOG',
       pin: String(fields[1] ?? ''),
-      timestamp: toISO(fields[2] ?? ''),
+      timestamp: fields[2] ?? '',
       status: Number(fields[3] ?? '0'),
-      verify: Number(fields[4] ?? '0'),
+      verify: verifyCodeToMethod(Number(fields[4] ?? '0')),
       workcode: String(fields[5] ?? ''),
       raw: fields.join('\t'),
     };
@@ -47,11 +16,11 @@ function parseATTLOG(fields, type) {
   // Plain format (Android): "PIN TIMESTAMP STATUS VERIFY WORKCODE r1 r2 r3 r4 r5 rid"
   if (type === 'plain')
     return {
-      type: 'ATTLOG',
+      type: 'REAL_TIME_LOG',
       pin: String(fields[0] ?? ''),
-      timestamp: toISO(fields[1] ?? ''),
+      timestamp: fields[1] ?? '',
       status: Number(fields[2] ?? '0'),
-      verify: Number(fields[3] ?? '0'),
+      verify: verifyCodeToMethod(Number(fields[3] ?? '0')),
       workcode: String(fields[4] ?? ''),
       raw: fields.join('\t'),
     };
@@ -63,75 +32,69 @@ function parseATTLOG(fields, type) {
   return {};
 }
 
-function parseKeyValuePairs(parts) {
-  const obj = {};
-  for (const p of parts) {
-    const idx = p.indexOf('=');
-    if (idx > 0) {
-      const k = p.slice(0, idx).trim();
-      const v = p.slice(idx + 1).trim();
-      obj[k] = v;
+function parseLine(line) {
+  // Trim CR/LF
+  const raw = line.trim();
+  if (!raw) return null;
+
+  // Identify by first token
+  const firstToken = raw.split('\t', 1)[0];
+
+  // Also by first space-separated token
+  const firstSpace = raw.split(' ', 1)[0];
+
+  switch (true) {
+    // USER profile
+    case firstSpace === 'USER': {
+      const kv = kvPairs(raw.substring(5));
+      return { type: 'USER', ...kv };
     }
-  }
-  return obj;
-}
 
-// USERINFO\tPIN=1\tName=John Doe\tPrivilege=0\tCard=123456\tUID=1001\t...
-function parseUserInfo(fields) {
-  const kv = parseKeyValuePairs(fields.slice(1));
-  const pin = kv.PIN || kv.Pin || kv.pin || '';
-  const name = kv.Name || kv.Username || kv.NAME || '';
-  const card = kv.Card || kv.CardNo || kv.Badgenumber || '';
-  const privilege = kv.Privilege || kv.Pri || kv.Role || '';
-  const department = kv.Dept || kv.Department || kv.DEPT || '';
-  const uid = kv.UID || kv.UserID || kv.UserId || kv.userid || kv.uid || ''; // internal device user id if present
-  return {
-    type: 'USERINFO',
-    pin: String(pin),
-    name,
-    card: String(card),
-    privilege: String(privilege),
-    department: String(department),
-    uid: String(uid),
-    raw: fields.join('\t'),
-    kv,
-  };
-}
-
-function parseCData(raw) {
-  const lines = splitLines(raw);
-  const entries = [];
-
-  for (const line of lines) {
-    if (/^STAMP/i.test(line)) continue;
-
-    const fields = splitFields(line);
-    if (!fields.length) continue;
-
-    const tag = fields[0].toUpperCase();
-
-    switch (tag) {
-      case 'ATTLOG':
-        entries.push(parseATTLOG(fields, 'tagged'));
-        break;
-      case 'OPLOG':
-        entries.push(parseATTLOG(fields, 'oplog'));
-        break;
-      case 'USERINFO':
-      case 'USER':
-        entries.push(parseUserInfo(fields));
-        break;
-      default:
-        if (fields.length >= 2 && looksLikeYmdHms(fields[1])) {
-          entries.push(parseATTLOG(fields, 'plain'));
-        } else {
-          entries.push({ type: 'UNKNOWN', raw: line });
-        }
-        break;
+    // BIODATA (finger/face/palm templates)
+    case firstSpace === 'BIODATA': {
+      const kv = kvPairs(raw.substring(8));
+      return { type: 'BIODATA', ...kv };
     }
-  }
 
-  return entries;
+    // USERPIC meta
+    case firstSpace === 'USERPIC': {
+      const kv = kvPairs(raw.substring(8));
+      return { type: 'USERPIC', ...kv };
+    }
+
+    // BIOPHOTO full image
+    case firstSpace === 'BIOPHOTO': {
+      const kv = kvPairs(raw.substring(9));
+      return { type: 'BIOPHOTO', ...kv };
+    }
+
+    // OPLOG operation log (tab separated)
+    case firstSpace === 'OPLOG': {
+      const parts = raw.split('\t');
+      const head = parts[0].split(' ');
+      const opCode = head[1];
+      return {
+        type: 'OPLOG',
+        opCode,
+        operatorPin: parts[1],
+        dateTime: parts[2],
+        status: parts[3],
+        p1: parts[4],
+        p2: parts[5],
+        p3: parts[6],
+        raw,
+      };
+    }
+
+    // Attendance (plain) if first token is an integer PIN
+    case /^[0-9]+$/.test(firstToken): {
+      const fields = raw.split('\t');
+      return parseATTLOG(fields, 'plain');
+    }
+
+    default:
+      return { type: 'UNKNOWN', raw };
+  }
 }
 
-module.exports = { parseCData };
+module.exports = { parseLine };

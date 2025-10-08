@@ -8,6 +8,6 @@ const commands = {
   clear_attendance: 'C:5:DATA DELETE ATTLOG',
   attendance_range:
     'C:5:DATA QUERY ATTLOG StartTime=2025-01-01 00:00:00 EndTime=2025-01-02 23:59:59',
-  delete_user: 'C:5:DATA DELETE USER PIN=6',
+  delete_user: 'C:5:DATA DELETE USERINFO PIN=6',
 };
 module.exports = commands;

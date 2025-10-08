@@ -1,7 +1,7 @@
 const express = require('express');
-const { parseCData } = require('./iclock-parser');
+const { parseLine } = require('./iclock-parser');
 const { PORT, PULL_MODE, DEFAULT_LOOKBACK_HOURS, ICLOCK_COMMAND, USE_CRLF } = require('./config');
-const { toISO, verifyCodeToMethod, fmtYmdHms, maxTimestampYmdHms } = require('./utils');
+const { verifyCodeToMethod, fmtYmdHms } = require('./utils');
 
 const app = express();
 app.use(express.json());
@@ -258,7 +258,7 @@ app.get('/iclock/getrequest', (req, res) => {
     );
 
   const queue = ensureQueue(sn);
-  maybeQueueUserSync(sn);
+  // maybeQueueUserSync(sn);
 
   if (queue.length) {
     const sep = USE_CRLF ? '\r\n' : '\n';
@@ -322,32 +322,12 @@ app.post('/iclock/cdata', (req, res) => {
     )} firstLine=${rawLines[0] ? JSON.stringify(rawLines[0]) : '<empty>'}`
   );
 
-  // Heuristic: if we receive USERINFO lines, mark any outstanding USER related commands as responded
-  const hasUserInfo = rawLines.some((l) => /^USERINFO\b/i.test(l));
-  if (hasUserInfo) {
-    markResponse(sn, (cmd) => /USERINFO|DATA QUERY USER|GET USER/gi.test(cmd));
-  }
-  // If we see ATTLOG lines, mark fetch attendance commands responded
-  const hasAtt = rawLines.some((l) => /^ATTLOG\b/i.test(l));
-  if (hasAtt) {
-    markResponse(sn, (cmd) => /ATTLOG/gi.test(cmd));
-  }
-  // Option-like (very heuristic) lines: contain '=' and maybe known keywords
-  const hasOptionLike = rawLines.some(
-    (l) =>
-      /^(INFO|PLATFORM|FIRMWARE|SERIAL)/i.test(l) ||
-      (/=/.test(l) && /^GET OPTION/i.test(l) === false && !/^ATTLOG|USERINFO/i.test(l))
-  );
-
   recordCDataEvent(sn, {
     at: new Date().toISOString(),
     lineCount: rawLines.length,
     firstLine: rawLines[0] || '',
-    hasUserInfo: !!hasUserInfo,
-    hasAttlog: !!hasAtt,
-    hasOptionLike: !!hasOptionLike,
   });
-  // Store raw body (truncated if huge)
+
   const truncated = rawLines.slice(0, 200).join('\n');
   if (!rawCDataStore.has(sn)) rawCDataStore.set(sn, []);
   const rawArr = rawCDataStore.get(sn);
@@ -355,91 +335,17 @@ app.post('/iclock/cdata', (req, res) => {
   if (rawArr.length > 100) rawArr.splice(0, rawArr.length - 100);
   markStaleCommands(sn);
 
-  const items = parseCData(raw).map((e) => ({
-    ...e,
-    sn,
-    table,
-    receivedAt: toISO(new Date()),
-  }));
+  const items = parseLine(raw);
 
-  // Persist users
-  for (const it of items) {
-    if (it.type === 'USERINFO') {
-      const umap = ensureUserMap(sn);
-      const pin = String(it.pin || '').trim();
-      if (pin) {
-        const existing = umap.get(pin) || {};
-        const nowIso = new Date().toISOString();
-        // Merge device authoritative fields, clear optimistic flag if present
-        const merged = { ...existing, ...it };
-        if (existing.optimistic) {
-          delete merged.optimistic;
-          merged.confirmedAt = nowIso;
-          if (!merged.createdAt) merged.createdAt = existing.createdAt || nowIso;
-        }
-        umap.set(pin, merged); // keep uid/name/card/etc.
-      }
-
-      // Auto-detect which key label the device uses for PIN / badge on first sight
-      if (!devicePinKey.get(sn) && it.kv) {
-        const kv = it.kv;
-        if (kv.Badgenumber) devicePinKey.set(sn, 'Badgenumber');
-        else if (kv.EnrollNumber) devicePinKey.set(sn, 'EnrollNumber');
-        else if (kv.PIN || kv.Pin || kv.pin) devicePinKey.set(sn, 'PIN');
-      }
-    }
-  }
-
-  const umap = ensureUserMap(sn);
-
-  // Enrich ATTLOG with method + user info
-  const enriched = items.map((it) => {
-    if (it.type !== 'ATTLOG') return it;
-    const user = umap.get(String(it.pin)) || {};
-    return {
-      ...it,
-      method: verifyCodeToMethod(it.verify),
-      user: {
-        pin: user.pin || String(it.pin),
-        uid: user.uid || '',
-        name: user.name || '',
-        card: user.card || '',
-        privilege: user.privilege || '',
-        department: user.department || '',
-      },
-    };
-  });
-
-  pushedLogs.push(...enriched);
+  pushedLogs.push(items);
 
   console.log('pushedLogs', pushedLogs);
 
-  // Update device lastStamp
-  const newest = maxTimestampYmdHms(enriched);
   const st = deviceState.get(sn) || {};
-  if (newest) st.lastStamp = newest;
   st.lastSeenAt = new Date().toISOString();
   deviceState.set(sn, st);
 
-  // Broadcast real-time enriched ATTLOGs
-  for (const it of enriched) {
-    if (it.type === 'ATTLOG') {
-      broadcastAttendance({
-        sn,
-        pin: it.pin,
-        uid: it.user?.uid || '',
-        name: it.user?.name || '',
-        card: it.user?.card || '',
-        timestamp: it.timestamp,
-        status: it.status,
-        verify: it.verify,
-        method: it.method,
-        table,
-      });
-    }
-  }
-
-  console.log(`cdata SN=${sn} items=${items.length} newest=${newest || 'n/a'}`);
+  console.log(`cdata SN=${sn} items=${items.length}`);
   res.status(200).send('OK');
 });
 
@@ -546,11 +452,6 @@ app.post('/api/device/add-user', (req, res) => {
   const sn = req.query.sn || req.query.SN;
   if (!sn) return res.status(400).json({ error: 'sn is required' });
 
-  // Example usage:
-  //   POST /api/device/add-user?sn=DEVICE_SN
-  //   Body: { "pin":"2", "name":"Jane", "privilege":0, "minimal":true, "sendVariants":true }
-  // For stubborn firmware also set in .env: USE_CRLF=1
-
   const {
     pin,
     name,
@@ -560,14 +461,9 @@ app.post('/api/device/add-user', (req, res) => {
     password,
     pin2,
     group,
-    minimal, // optional: send only required fields
-    sendVariants, // optional: also send alternate verbs
     fullQuery, // optional: force full user list query
-    compat, // optional: shortcut enabling variants
     pinKey, // override PIN field label (e.g. Badgenumber, EnrollNumber)
-    single, // if true send only the base command
     style, // 'spaces' to use spaces instead of tabs
-    uid, // optional internal user id
     optimistic,
   } = req.body || {};
   if (!pin) return res.status(400).json({ error: 'pin is required' });
@@ -585,7 +481,6 @@ app.post('/api/device/add-user', (req, res) => {
   const pwdVal = clean(password || '');
   const pin2Val = clean(pin2 || '');
   const grpVal = clean(group || '');
-  const uId = clean(uid || ''); // optional internal user id
 
   // Build parts with TAB separators (some firmware require tabs explicitly)
   function join(parts) {
@@ -593,90 +488,24 @@ app.post('/api/device/add-user', (req, res) => {
   }
   const autoKey = devicePinKey.get(sn);
   const pinLabel = (pinKey || autoKey || 'PIN').trim();
-  const uIdLabel = 'UID'; // Fixed: removed uid variable conflict
   const baseParts = [`${pinLabel}=${pinVal}`];
   if (nameVal) baseParts.push(`Name=${nameVal}`);
-  baseParts.push(`Pri=${priVal}`);
-  if (!minimal && cardVal) baseParts.push(`Card=${cardVal}`);
-  if (!minimal && deptVal) baseParts.push(`Dept=${deptVal}`);
-  if (!minimal && pwdVal) baseParts.push(`Passwd=${pwdVal}`);
-  if (!minimal && pin2Val) baseParts.push(`PIN2=${pin2Val}`);
-  if (!minimal && grpVal) baseParts.push(`Grp=${grpVal}`);
-  if (!minimal && uId) baseParts.push(`UID=${uId}`); // internal id, not standard
+  baseParts.push(`Privilege=${priVal}`);
+  if (cardVal) baseParts.push(`Card=${cardVal}`);
+  if (deptVal) baseParts.push(`Dept=${deptVal}`);
+  if (pwdVal) baseParts.push(`Passwd=${pwdVal}`);
+  if (pin2Val) baseParts.push(`PIN2=${pin2Val}`);
+  if (grpVal) baseParts.push(`Grp=${grpVal}`);
 
-  const base = `SET USERINFO ${join(baseParts)}`;
+  const base = `C:1:DATA UPDATE USERINFO ${join(baseParts)}`;
   const commands = [base];
 
-  let wantVariants = !!(sendVariants || compat);
-  if (single) wantVariants = false;
-  if (wantVariants) {
-    // DATA UPDATE variant (with tabs)
-    const updateParts = baseParts.filter(Boolean);
-    commands.push(`DATA UPDATE USERINFO ${join(updateParts)}`);
-    // Minimal SET (only PIN + Pri)
-    commands.push(
-      `SET USERINFO ${join([
-        `User Id=${pinVal}`,
-        `Name=${nameVal}`,
-        `UserRole=${priVal}`,
-        `UID=${uId}`,
-      ])}`
-    );
-    commands.push(`SET USERINFO ${join([`${pinLabel}=${pinVal}`, `Pri=${priVal}`, `UID=${uId}`])}`);
-    // Privilege= variant
-    const privParts = [
-      `${pinLabel}=${pinVal}`,
-      nameVal ? `Name=${nameVal}` : null,
-      `Privilege=${priVal}`,
-      cardVal ? `Card=${cardVal}` : null,
-      deptVal ? `Dept=${deptVal}` : null,
-      uId ? `UID=${uId}` : null,
-    ].filter(Boolean);
-    commands.push(`SET USERINFO ${join(privParts)}`);
-    // CardNo variant
-    if (cardVal) {
-      const cardNoParts = [
-        `${pinLabel}=${pinVal}`,
-        nameVal ? `Name=${nameVal}` : null,
-        `Pri=${priVal}`,
-        `CardNo=${cardVal}`,
-        uId ? `UID=${uId}` : null,
-      ].filter(Boolean);
-      commands.push(`SET USERINFO ${join(cardNoParts)}`);
-    }
-    // Reordered variant (Card then Name) - some devices care about order
-    if (cardVal) {
-      const reorder = [
-        `${pinLabel}=${pinVal}`,
-        `Card=${cardVal}`,
-        nameVal ? `Name=${nameVal}` : null,
-        `Pri=${priVal}`,
-        uId ? `UID=${uId}` : null,
-      ].filter(Boolean);
-      commands.push(`SET USER ${join(reorder)}`);
-    }
-    // GET single user
-    commands.push(`GET USER ${pinLabel}=${pinVal}`);
-    commands.push(`GET USER ${uIdLabel}=${uId}`);
-    // Possible commit (rarely needed, harmless if ignored)
-    commands.push(`COMMIT USER`);
-    // Plain USER line without verb (some odd firmware treat it as implicit SET)
-    const plainParts = baseParts.filter(Boolean);
-    commands.push(`USER ${join(plainParts)}`);
-    // Space separated variant
-    if (style !== 'spaces') commands.push(`SET USER ${plainParts.join(' ')}`);
-    // Variant with PIN first then Privilege explicitly then Name (different order)
-    const ordered = [`${pinLabel}=${pinVal}`, `Privilege=${priVal}`];
-    if (nameVal) ordered.push(`Name=${nameVal}`);
-    commands.push(`SET USER ${join(ordered)}`);
-  }
-
   // Query that PIN (may be ignored, harmless if unsupported)
-  commands.push(`DATA QUERY USER ${pinLabel}=${pinVal}`);
+  commands.push(`C:2:DATA QUERY USER ${pinLabel}=${pinVal}`);
 
   // Full list query to force refresh
-  if (fullQuery || wantVariants) {
-    commands.push('DATA QUERY USER');
+  if (fullQuery) {
+    commands.push('C:3:DATA QUERY USER');
   }
 
   const q = ensureQueue(sn);
@@ -784,7 +613,7 @@ app.post('/api/device/force-user-sync', (req, res) => {
   const st = deviceState.get(sn) || {};
   delete st.lastUserSyncAt;
   deviceState.set(sn, st);
-  ensureQueue(sn).push('DATA QUERY USERINFO');
+  ensureQueue(sn).push(`C:1:DATA QUERY USERINFO`);
   if (clearOptimistic) {
     const umap = usersByDevice.get(sn);
     if (umap) {
@@ -793,24 +622,24 @@ app.post('/api/device/force-user-sync', (req, res) => {
       }
     }
   }
-  res.json({ ok: true, queued: 'DATA QUERY USERINFO', clearOptimistic: !!clearOptimistic });
+  res.json({ ok: true, queued: 'C:1:DATA QUERY USERINFO', clearOptimistic: !!clearOptimistic });
 });
 
-// Inspect recent raw cdata event summaries
-app.get('/api/device/cdata-events', (req, res) => {
-  const sn = req.query.sn || req.query.SN;
-  if (!sn) return res.status(400).json({ error: 'sn is required' });
-  const events = (cdataEvents.get(sn) || []).slice(-100);
-  res.json({ sn, count: events.length, events });
-});
+// // Inspect recent raw cdata event summaries
+// app.get('/api/device/cdata-events', (req, res) => {
+//   const sn = req.query.sn || req.query.SN;
+//   if (!sn) return res.status(400).json({ error: 'sn is required' });
+//   const events = (cdataEvents.get(sn) || []).slice(-100);
+//   res.json({ sn, count: events.length, events });
+// });
 
-// Raw cdata bodies (recent)
-app.get('/api/device/raw-cdata', (req, res) => {
-  const sn = req.query.sn || req.query.SN;
-  if (!sn) return res.status(400).json({ error: 'sn is required' });
-  const arr = (rawCDataStore.get(sn) || []).slice(-50);
-  res.json({ sn, count: arr.length, items: arr });
-});
+// // Raw cdata bodies (recent)
+// app.get('/api/device/raw-cdata', (req, res) => {
+//   const sn = req.query.sn || req.query.SN;
+//   if (!sn) return res.status(400).json({ error: 'sn is required' });
+//   const arr = (rawCDataStore.get(sn) || []).slice(-50);
+//   res.json({ sn, count: arr.length, items: arr });
+// });
 
 // Poll history
 app.get('/api/device/polls', (req, res) => {
@@ -818,48 +647,6 @@ app.get('/api/device/polls', (req, res) => {
   if (!sn) return res.status(400).json({ error: 'sn is required' });
   const arr = (pollHistory.get(sn) || []).slice(-100);
   res.json({ sn, count: arr.length, polls: arr });
-});
-
-// Force stale re-evaluation & optionally enqueue fallback legacy variants (without C:) if nothing responded
-app.post('/api/device/diagnose', (req, res) => {
-  const sn = req.query.sn || req.query.SN;
-  if (!sn) return res.status(400).json({ error: 'sn is required' });
-  const { enqueueFallback } = req.body || {};
-  markStaleCommands(sn);
-  let enqueued = [];
-  if (enqueueFallback) {
-    const list = sentCommands.get(sn) || [];
-    const hasAnyUserReply = (cdataEvents.get(sn) || []).some((e) => e.hasUserInfo);
-    if (!hasAnyUserReply) {
-      const fallback = [
-        'DATA QUERY USERINFO',
-        'GET USERINFO',
-        'DATA QUERY USER',
-        'GET USER',
-        'GET OPTION INFO',
-      ];
-      const q = ensureQueue(sn);
-      fallback.forEach((f) => q.push(f.startsWith('C:') ? f : `${f}`));
-      enqueued = fallback;
-    }
-  }
-  res.json({ ok: true, enqueued, staleSecondsThreshold: STALE_SECONDS });
-});
-
-// Quick test helper (optional)
-app.post('/api/device/add-user/test', (req, res) => {
-  const sn = req.query.sn || req.query.SN;
-  if (!sn) return res.status(400).json({ error: 'sn is required' });
-  const n = Date.now() % 100000;
-  req.body = {
-    pin: String(n),
-    name: 'Test' + n,
-    card: String(n),
-    privilege: 0,
-    minimal: true,
-    sendVariants: true,
-  };
-  return app._router.handle(req, res, () => {}, 'post', '/api/device/add-user');
 });
 
 // Delete a user (queue multiple deletion variants)
@@ -947,26 +734,6 @@ app.post('/api/device/enqueue-command', (req, res) => {
   res.json({ ok: true, queued: q.length });
 });
 
-app.post('/api/device/add-user-minimal', (req, res) => {
-  const sn = req.query.sn || req.query.SN;
-  if (!sn) return res.status(400).json({ error: 'sn is required' });
-  const { pin, name, privilege = 0, card } = req.body || {};
-  if (!pin) return res.status(400).json({ error: 'pin is required' });
-
-  const pinVal = String(pin).trim();
-  const nameVal = (name || '').replace(/[\r\n]/g, ' ').trim();
-  const cardVal = (card || pinVal).trim();
-
-  const cmd = `SET USERINFO PIN=${pinVal}${
-    nameVal ? ` Name=${nameVal}` : ''
-  } Privilege=${privilege} Card=${cardVal}`;
-  const q = ensureQueue(sn);
-  q.push(cmd);
-  q.push('DATA QUERY USERINFO'); // full list to confirm
-  console.log(`[add-user-minimal] SN=${sn} queued:\n  > ${cmd}`);
-  res.json({ ok: true, enqueued: [cmd], queueSize: q.length });
-});
-
 app.post('/api/device/custom-command', (req, res) => {
   const sn = req.query.sn || req.query.SN;
   if (!sn) return res.status(400).json({ error: 'sn is required' });
@@ -994,21 +761,21 @@ app.post('/api/device/probe', (req, res) => {
   const q = ensureQueue(sn);
   const cmds = [
     // Attendance queries
-    `DATA QUERY ATTLOG StartTime=${startStr} EndTime=${endStr}`,
-    `GET ATTLOG StartTime=${startStr} EndTime=${endStr}`,
-    'ATTLOG',
+    `C:1:DATA QUERY ATTLOG StartTime=${startStr} EndTime=${endStr}`,
+    `C:1:GET ATTLOG StartTime=${startStr} EndTime=${endStr}`,
+    `C:1:ATTLOG`,
     // User list queries
-    'DATA QUERY USERINFO',
-    'GET USERINFO',
-    'DATA QUERY USER',
+    `C:1:DATA QUERY USERINFO`,
+    `C:1:GET USERINFO`,
+    `C:1:DATA QUERY USER`,
     // Option queries (some firmwares respond with OPTION lines)
-    'GET OPTION DATE',
-    'GET OPTION INFO',
-    'GET OPTION PLATFORM',
+    `C:1:GET OPTION DATE`,
+    `C:1:GET OPTION INFO`,
+    `C:1:GET OPTION PLATFORM`,
   ];
   if (pin) {
-    cmds.push(`GET USER PIN=${pin}`);
-    cmds.push(`DATA QUERY USER PIN=${pin}`);
+    cmds.push(`C:1:GET USER PIN=${pin}`);
+    cmds.push(`C:1:DATA QUERY USER PIN=${pin}`);
   }
   // Deduplicate
   const seen = new Set();
