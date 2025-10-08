@@ -6,11 +6,6 @@ const { verifyCodeToMethod, fmtYmdHms } = require('./utils');
 const app = express();
 app.use(express.json());
 
-// app.use("/", (req, res, next) => {
-// 	console.log(`${req.method} -  ${req.url}`);
-// 	next();
-// });
-
 app.use('/iclock', express.text({ type: '*/*', limit: '10mb' }));
 
 // In-memory stores (replace with DB in prod)
@@ -78,16 +73,7 @@ function markDelivered(sn, ids, bytes) {
     }
   }
 }
-function markResponse(sn, matcherFn) {
-  const list = sentCommands.get(sn);
-  if (!list) return;
-  const now = new Date().toISOString();
-  for (const rec of list) {
-    if (!rec.respondedAt && matcherFn(rec.cmd)) {
-      rec.respondedAt = now;
-    }
-  }
-}
+
 function recordCDataEvent(sn, summary) {
   if (!cdataEvents.has(sn)) cdataEvents.set(sn, []);
   const arr = cdataEvents.get(sn);
@@ -161,26 +147,13 @@ function buildFetchCommand(sn) {
 
   switch (commandSyntax) {
     case 'DATA_QUERY':
-      return `DATA QUERY ATTLOG StartTime=${start} EndTime=${end}`;
+      return `C:1:DATA QUERY ATTLOG StartTime=${start} EndTime=${end}`;
     case 'GET_ATTLOG':
-      return `GET ATTLOG StartTime=${start} EndTime=${end}`;
+      return `C:1:GET ATTLOG StartTime=${start} EndTime=${end}`;
     case 'ATTLOG':
-      return `ATTLOG`;
+      return `C:1:ATTLOG`;
     default:
-      return `DATA QUERY ATTLOG StartTime=${start} EndTime=${end}`;
-  }
-}
-
-// Auto-queue a user fetch occasionally
-function maybeQueueUserSync(sn) {
-  const st = deviceState.get(sn) || {};
-  const last = st.lastUserSyncAt ? new Date(st.lastUserSyncAt) : null;
-  const now = new Date();
-  const stale = !last || now.getTime() - last.getTime() > 6 * 3600 * 1000; // 6h
-  if (stale) {
-    ensureQueue(sn).push('DATA QUERY USERINFO');
-    st.lastUserSyncAt = now.toISOString();
-    deviceState.set(sn, st);
+      return `C:1:DATA QUERY ATTLOG StartTime=${start} EndTime=${end}`;
   }
 }
 
@@ -221,15 +194,6 @@ app.get('/api/events/stream', (req, res) => {
   });
 });
 
-function broadcastAttendance(event) {
-  const data = JSON.stringify(event);
-  for (const client of sseClients) {
-    try {
-      client.write(`event: attendance\ndata: ${data}\n\n`);
-    } catch (_) {}
-  }
-}
-
 // iClock/ADMS endpoints
 app.get('/iclock/ping', (req, res) => {
   const sn = req.query.SN || req.query.sn || '';
@@ -258,7 +222,6 @@ app.get('/iclock/getrequest', (req, res) => {
     );
 
   const queue = ensureQueue(sn);
-  // maybeQueueUserSync(sn);
 
   if (queue.length) {
     const sep = USE_CRLF ? '\r\n' : '\n';
