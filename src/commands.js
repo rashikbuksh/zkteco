@@ -9,5 +9,6 @@ const commands = {
   attendance_range:
     'C:5:DATA QUERY ATTLOG StartTime=2025-01-01 00:00:00 EndTime=2025-01-02 23:59:59',
   delete_user: 'C:5:DATA DELETE USERINFO PIN=6',
+  get_all_attendance: 'C:1:ATTLOG',
 };
 module.exports = commands;

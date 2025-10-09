@@ -9,7 +9,8 @@ app.use(express.json());
 app.use('/iclock', express.text({ type: '*/*', limit: '10mb' }));
 
 // In-memory stores (replace with DB in prod)
-const pushedLogs = []; // raw + enriched entries
+const pushedLogs = []; // raw + enriched entries -- attendance real time logs
+const informationLogs = []; // raw INFO lines -- user info, user details
 const deviceState = new Map(); // sn -> { lastStamp, lastSeenAt, lastUserSyncAt }
 const commandQueue = new Map(); // sn -> [ '...' ]
 const usersByDevice = new Map(); // sn -> Map(pin -> user)
@@ -300,9 +301,15 @@ app.post('/iclock/cdata', (req, res) => {
 
   const items = parseLine(raw);
 
-  pushedLogs.push(items);
+  if (items.type === 'REAL_TIME_LOG') {
+    pushedLogs.push(items);
+  } else {
+    informationLogs.push(items);
+  }
 
   console.log('pushedLogs', pushedLogs);
+
+  console.log('informationLogs', informationLogs);
 
   const st = deviceState.get(sn) || {};
   st.lastSeenAt = new Date().toISOString();
