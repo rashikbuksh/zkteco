@@ -244,10 +244,10 @@ app.get('/iclock/getrequest', (req, res) => {
     cmds.forEach((c) => {
       recordSentCommand(sn, c, remote);
       const list = sentCommands.get(sn);
-      console.log(`list`, list);
+      // console.log(`list`, list);
       if (list) justIds.push(list[list.length - 1].id);
     });
-    console.log(`body`, body);
+    // console.log(`body`, body);
     // Attempt send
     res.status(200).send(body);
     // Approximate bytes (body length in UTF-8)
@@ -280,11 +280,11 @@ app.post('/iclock/cdata', (req, res) => {
 
   // Debug summary of payload
   const rawLines = String(raw).replace(/\r/g, '\n').split('\n').filter(Boolean);
-  console.log(
-    `[cdata] SN=${sn} table=${table} lines=${rawLines.length} bytes=${Buffer.byteLength(
-      String(raw)
-    )} firstLine=${rawLines[0] ? JSON.stringify(rawLines[0]) : '<empty>'}`
-  );
+  // console.log(
+  //   `[cdata] SN=${sn} table=${table} lines=${rawLines.length} bytes=${Buffer.byteLength(
+  //     String(raw)
+  //   )} firstLine=${rawLines[0] ? JSON.stringify(rawLines[0]) : '<empty>'}`
+  // );
 
   recordCDataEvent(sn, {
     at: new Date().toISOString(),
@@ -299,23 +299,87 @@ app.post('/iclock/cdata', (req, res) => {
   if (rawArr.length > 100) rawArr.splice(0, rawArr.length - 100);
   markStaleCommands(sn);
 
-  const items = parseLine(raw);
-
-  if (items.type === 'REAL_TIME_LOG') {
-    pushedLogs.push(items);
-  } else {
-    informationLogs.push(items);
+  // Process each line individually to handle multiple USER entries
+  const allParsedItems = [];
+  for (const line of rawLines) {
+    if (line.trim()) {
+      const items = parseLine(line);
+      if (items) {
+        allParsedItems.push(items);
+      }
+    }
   }
 
-  console.log('pushedLogs', pushedLogs);
+  // Process all parsed items
+  let userCount = 0;
+  let duplicateCount = 0;
 
-  console.log('informationLogs', informationLogs);
+  for (const items of allParsedItems) {
+    if (items.type === 'REAL_TIME_LOG') {
+      pushedLogs.push(items);
+    } else {
+      informationLogs.push(items);
+      if (items.type === 'USER') {
+        // Auto-detect PIN key from the first USER with PIN-like fields
+        const pinKeys = ['PIN', 'Badgenumber', 'EnrollNumber', 'CardNo', 'Card'];
+        let userPin = null;
+        let detectedKey = null;
+
+        // Find which PIN field is present
+        for (const key of pinKeys) {
+          if (items[key]) {
+            userPin = String(items[key]);
+            detectedKey = key;
+            break;
+          }
+        }
+
+        if (userPin && detectedKey) {
+          // Auto-detect and cache the PIN key for this device
+          if (!devicePinKey.has(sn)) {
+            devicePinKey.set(sn, detectedKey);
+            // console.log(`[auto-detect] SN=${sn} detected PIN key: ${detectedKey}`);
+          }
+
+          const umap = ensureUserMap(sn);
+
+          // Avoid overwriting existing users with same PIN
+          if (!umap.has(userPin)) {
+            umap.set(userPin, { ...items, pin: userPin });
+            userCount++;
+            // console.log(`[user-added] SN=${sn} PIN=${userPin} Name=${items.Name || 'N/A'}`);
+          } else {
+            duplicateCount++;
+            // console.log(
+            //   `[user-exists] SN=${sn} PIN=${userPin} Name=${
+            //     items.Name || 'N/A'
+            //   } - skipping duplicate`
+            // );
+          }
+        }
+      }
+    }
+  }
+
+  // Summary logging for user operations
+  if (userCount > 0 || duplicateCount > 0) {
+    const totalUsers = ensureUserMap(sn).size;
+    console.log(
+      `[user-summary] SN=${sn} added=${userCount} duplicates_skipped=${duplicateCount} total_users=${totalUsers}`
+    );
+  }
+
+  console.log(usersByDevice, 'usersByDevice');
+
+  // console.log('pushedLogs', pushedLogs);
+
+  // console.log('informationLogs', informationLogs);
 
   const st = deviceState.get(sn) || {};
   st.lastSeenAt = new Date().toISOString();
   deviceState.set(sn, st);
 
-  console.log(`cdata SN=${sn} items=${items.length}`);
+  console.log(`cdata SN=${sn} parsed_items=${allParsedItems.length} raw_lines=${rawLines.length}`);
   res.status(200).send('OK');
 });
 
@@ -672,6 +736,24 @@ app.post('/api/device/drip-mode', (req, res) => {
   res.json({ ok: true, dripMode });
 });
 
+// Get next available PIN for a device
+app.get('/api/device/next-pin', (req, res) => {
+  const sn = req.query.sn || req.query.SN;
+  if (!sn) return res.status(400).json({ error: 'sn is required' });
+
+  const startPin = Number(req.query.startPin) || 1;
+  const nextPin = getNextAvailablePin(sn, startPin);
+  const umap = usersByDevice.get(sn) || new Map();
+  const existingCount = umap.size;
+
+  res.json({
+    sn,
+    nextAvailablePin: nextPin,
+    existingUserCount: existingCount,
+    startPin,
+  });
+});
+
 // Inspect / override detected PIN key label
 app.get('/api/device/pin-key', (req, res) => {
   const sn = req.query.sn || req.query.SN;
@@ -715,6 +797,184 @@ app.post('/api/device/custom-command', (req, res) => {
   q.push(cmd);
   console.log(`[custom-command] SN=${sn} queued:\n  > ${cmd}`);
   res.json({ ok: true, enqueued: [cmd], queueSize: q.length });
+});
+
+// Helper function to find next available PIN for a device
+function getNextAvailablePin(sn, startPin = 1) {
+  const umap = usersByDevice.get(sn) || new Map();
+  let pin = Number(startPin) || 1;
+
+  // Find the highest existing PIN to start from
+  const existingPins = Array.from(umap.keys())
+    .map((p) => Number(p))
+    .filter((p) => !isNaN(p));
+  if (existingPins.length > 0) {
+    const maxPin = Math.max(...existingPins);
+    pin = Math.max(pin, maxPin + 1);
+  }
+
+  // Find next available PIN
+  while (umap.has(String(pin))) {
+    pin++;
+  }
+
+  return pin;
+}
+
+// Bulk user insertion with auto PIN generation
+app.post('/api/device/bulk-add-users', (req, res) => {
+  const sn = req.query.sn || req.query.SN;
+  if (!sn) return res.status(400).json({ error: 'sn is required' });
+
+  const {
+    users, // array of user objects: [{ name: 'Anik2', card?: '123', privilege?: 0, department?: '', password?: '', pin2?: '', group?: '' }]
+    startPin, // optional: starting PIN number (default: auto-detect next available)
+    pinKey, // override PIN field label (e.g. Badgenumber, EnrollNumber)
+    style, // 'spaces' to use spaces instead of tabs
+    optimistic = true, // whether to apply optimistic caching
+    fullQuery = true, // whether to query full user list after bulk insert
+  } = req.body || {};
+
+  if (!Array.isArray(users) || users.length === 0) {
+    return res.status(400).json({ error: 'users array is required and must not be empty' });
+  }
+
+  const clean = (v) =>
+    String(v ?? '')
+      .replace(/[\r\n]/g, ' ')
+      .trim();
+
+  function join(parts) {
+    return style === 'spaces' ? parts.join(' ') : parts.join('\t');
+  }
+
+  const autoKey = devicePinKey.get(sn);
+  const pinLabel = (pinKey || autoKey || 'PIN').trim();
+  const q = ensureQueue(sn);
+  const umap = ensureUserMap(sn);
+  const nowIso = new Date().toISOString();
+
+  let currentPin = getNextAvailablePin(sn, startPin);
+  const commands = [];
+  const processedUsers = [];
+  const errors = [];
+
+  console.log(
+    `[bulk-add-users] SN=${sn} starting bulk insert of ${users.length} users, starting from PIN ${currentPin}`
+  );
+
+  for (let i = 0; i < users.length; i++) {
+    const user = users[i];
+
+    try {
+      // Validate required fields
+      if (!user.name || !clean(user.name)) {
+        errors.push({ index: i, error: 'name is required', user });
+        continue;
+      }
+
+      // Use provided PIN or auto-generate
+      const pinVal = user.pin ? clean(user.pin) : String(currentPin);
+
+      // Check if PIN already exists
+      if (umap.has(pinVal)) {
+        errors.push({ index: i, error: `PIN ${pinVal} already exists`, user });
+        continue;
+      }
+
+      const nameVal = clean(user.name);
+      const cardVal = clean(user.card || '');
+      const priVal = Number(user.privilege ?? 0);
+      const deptVal = clean(user.department || '');
+      const pwdVal = clean(user.password || '');
+      const pin2Val = clean(user.pin2 || '');
+      const grpVal = clean(user.group || '');
+
+      // Build command parts
+      const baseParts = [`${pinLabel}=${pinVal}`];
+      if (nameVal) baseParts.push(`Name=${nameVal}`);
+      baseParts.push(`Privilege=${priVal}`);
+      if (cardVal) baseParts.push(`Card=${cardVal}`);
+      if (deptVal) baseParts.push(`Dept=${deptVal}`);
+      if (pwdVal) baseParts.push(`Passwd=${pwdVal}`);
+      if (pin2Val) baseParts.push(`PIN2=${pin2Val}`);
+      if (grpVal) baseParts.push(`Grp=${grpVal}`);
+
+      const command = `C:${i + 1}:DATA UPDATE USERINFO ${join(baseParts)}`;
+      commands.push(command);
+
+      // Optimistic cache update
+      if (optimistic) {
+        umap.set(pinVal, {
+          pin: pinVal,
+          name: nameVal,
+          card: cardVal,
+          privilege: String(priVal),
+          department: deptVal,
+          password: pwdVal ? '****' : undefined,
+          pin2: pin2Val || undefined,
+          group: grpVal || undefined,
+          updatedLocallyAt: nowIso,
+          createdAt: nowIso,
+          optimistic: true,
+        });
+      }
+
+      processedUsers.push({
+        index: i,
+        pin: pinVal,
+        name: nameVal,
+        command,
+      });
+
+      // Increment PIN for next user (if auto-generating)
+      if (!user.pin) {
+        currentPin++;
+      }
+    } catch (error) {
+      errors.push({ index: i, error: error.message, user });
+    }
+  }
+
+  // Add query commands for verification
+  if (fullQuery) {
+    commands.push(`C:${commands.length + 1}:DATA QUERY USERINFO`);
+  }
+
+  // Queue all commands
+  commands.forEach((cmd) => q.push(cmd));
+
+  // Deduplicate queue
+  const seen = new Set();
+  const queueArray = [...q];
+  q.length = 0; // Clear queue
+
+  for (const cmd of queueArray) {
+    if (!seen.has(cmd)) {
+      seen.add(cmd);
+      q.push(cmd);
+    }
+  }
+
+  console.log(
+    `[bulk-add-users] SN=${sn} queued ${commands.length} commands for ${processedUsers.length} users`
+  );
+
+  res.json({
+    ok: true,
+    sn,
+    processed: processedUsers.length,
+    errors: errors.length,
+    totalRequested: users.length,
+    commands: commands.length,
+    queueSize: q.length,
+    processedUsers,
+    errors,
+    nextAvailablePin: currentPin,
+    pinLabelUsed: pinLabel,
+    optimisticApplied: optimistic,
+    note: 'Users will be created with auto-generated PINs starting from the next available PIN number. Check /api/users to verify creation.',
+  });
 });
 
 // Diagnostic probe: enqueue a suite of commands that should, if supported, elicit responses.
