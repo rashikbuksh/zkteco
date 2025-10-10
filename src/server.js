@@ -41,6 +41,33 @@ function ensureUserMap(sn) {
   if (!usersByDevice.has(sn)) usersByDevice.set(sn, new Map());
   return usersByDevice.get(sn);
 }
+
+// Ensure users are fetched from device if usersByDevice is empty
+async function ensureUsersFetched(sn) {
+  const umap = ensureUserMap(sn);
+
+  // If we have users, return immediately
+  if (umap.size > 0) {
+    return umap;
+  }
+
+  // If no users cached, queue a fetch command
+  console.log(`[ensure-users] SN=${sn} no cached users, queuing fetch command`);
+  const q = ensureQueue(sn);
+
+  // Only queue if not already queued
+  const hasUserQuery = q.some((cmd) => cmd.includes('C:1:DATA QUERY USERINFO'));
+
+  if (!hasUserQuery) {
+    q.push('C:1:DATA QUERY USERINFO');
+    console.log(`[ensure-users] SN=${sn} queued user fetch command`);
+  } else {
+    console.log(`[ensure-users] SN=${sn} user fetch already queued`);
+  }
+
+  return umap;
+}
+
 function ensureSentList(sn) {
   if (!sentCommands.has(sn)) sentCommands.set(sn, []);
   return sentCommands.get(sn);
@@ -159,7 +186,30 @@ function buildFetchCommand(sn) {
 }
 
 // Health
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
+  // Process users with proper async handling
+  const deviceEntries = Array.from(deviceState.entries());
+
+  // Debug: Log current usersByDevice state
+  console.log('[health] Current usersByDevice map:');
+  for (const [sn, umap] of usersByDevice.entries()) {
+    console.log(`  SN=${sn} users=${umap.size} pins=[${Array.from(umap.keys()).join(', ')}]`);
+  }
+
+  const usersSummary = await Promise.all(
+    deviceEntries.map(async ([sn, s]) => {
+      console.log(`[health] Processing device SN=${sn}`);
+      await ensureUsersFetched(sn);
+      const umap = usersByDevice.get(sn);
+      const count = umap ? umap.size : 0;
+      console.log(`[health] SN=${sn} final count=${count}`);
+      return {
+        sn,
+        count,
+      };
+    })
+  );
+
   res.json({
     ok: true,
     devices: Array.from(deviceState.entries()).map(([sn, s]) => ({
@@ -168,10 +218,7 @@ app.get('/health', (req, res) => {
       lastSeenAt: s.lastSeenAt,
       lastUserSyncAt: s.lastUserSyncAt,
     })),
-    users: Array.from(usersByDevice.entries()).map(([sn, m]) => ({
-      sn,
-      count: m.size,
-    })),
+    users: usersSummary,
     pullMode,
     commandSyntax,
   });
@@ -268,9 +315,6 @@ app.get('/iclock/getrequest', (req, res) => {
   recordPoll(sn, (req.socket && req.socket.remoteAddress) || null, queue.length, 0);
   return res.status(200).send('');
 });
-
-// Some firmware probe with GET /iclock/cdata — acknowledge OK
-app.get('/iclock/cdata', (req, res) => res.status(200).send('OK: Nothing handled in here'));
 
 // Device posts logs here in plain text
 app.post('/iclock/cdata', (req, res) => {
@@ -369,7 +413,7 @@ app.post('/iclock/cdata', (req, res) => {
     );
   }
 
-  console.log(usersByDevice, 'usersByDevice');
+  // console.log(usersByDevice, 'usersByDevice');
 
   // console.log('pushedLogs', pushedLogs);
 
@@ -410,7 +454,7 @@ app.post('/api/device/pull-users', (req, res) => {
   const sn = req.query.sn || req.query.SN;
   if (!sn) return res.status(400).json({ error: 'sn is required' });
 
-  const cmd = 'DATA QUERY USERINFO';
+  const cmd = 'C:1:DATA QUERY USERINFO';
   ensureQueue(sn).push(cmd);
 
   const st = deviceState.get(sn) || {};
@@ -444,35 +488,23 @@ app.get('/api/attendances', (req, res) => {
   res.json({ count: simplified.length, logs: simplified });
 });
 
-// Users collected from USERINFO
-app.get('/api/users', (req, res) => {
-  const sn = req.query.sn || req.query.SN;
-  if (!sn) {
-    const summary = Array.from(usersByDevice.entries()).map(([dsn, m]) => ({
-      sn: dsn,
-      count: m.size,
-    }));
-    return res.json({ devices: summary });
+// Debug endpoint to check usersByDevice map
+app.get('/api/debug/users-map', (req, res) => {
+  const result = {};
+  for (const [sn, umap] of usersByDevice.entries()) {
+    result[sn] = {
+      count: umap.size,
+      users: Array.from(umap.entries()).map(([pin, user]) => ({
+        pin,
+        name: user.name || user.Name || 'N/A',
+        type: user.type,
+      })),
+    };
   }
-  const m = usersByDevice.get(sn) || new Map();
-  const users = Array.from(m.values()).map((u) => ({
-    sn,
-    pin: u.pin,
-    uid: u.uid || '',
-    name: u.name,
-    card: u.card,
-    privilege: u.privilege,
-    department: u.department,
-  }));
-  res.json({ sn, count: users.length, users });
-});
-
-app.get('/api/push/logs', (req, res) => {
-  const { sn, type } = req.query;
-  let data = pushedLogs;
-  if (sn) data = data.filter((x) => x.sn === sn);
-  if (type) data = data.filter((x) => x.type === String(type).toUpperCase());
-  res.json({ count: data.length, logs: data });
+  res.json({
+    usersByDeviceMap: result,
+    totalDevices: usersByDevice.size,
+  });
 });
 
 app.get('/api/device/debug/queue', (req, res) => {
@@ -482,9 +514,12 @@ app.get('/api/device/debug/queue', (req, res) => {
   res.json({ sn, queued: q });
 });
 
-app.post('/api/device/add-user', (req, res) => {
+app.post('/api/device/add-user', async (req, res) => {
   const sn = req.query.sn || req.query.SN;
   if (!sn) return res.status(400).json({ error: 'sn is required' });
+
+  // Ensure users are fetched before processing
+  await ensureUsersFetched(sn);
 
   const {
     pin,
@@ -500,14 +535,16 @@ app.post('/api/device/add-user', (req, res) => {
     style, // 'spaces' to use spaces instead of tabs
     optimistic,
   } = req.body || {};
-  if (!pin) return res.status(400).json({ error: 'pin is required' });
+
+  if (!name) return res.status(400).json({ error: 'name is required' });
 
   const clean = (v) =>
     String(v ?? '')
       .replace(/[\r\n]/g, ' ')
       .trim();
 
-  const pinVal = clean(pin);
+  // Auto-generate PIN if not provided
+  const pinVal = pin ? clean(pin) : String(getNextAvailablePin(sn));
   const nameVal = clean(name || '');
   const cardVal = clean(card || '');
   const priVal = Number(privilege ?? 0);
@@ -515,6 +552,15 @@ app.post('/api/device/add-user', (req, res) => {
   const pwdVal = clean(password || '');
   const pin2Val = clean(pin2 || '');
   const grpVal = clean(group || '');
+
+  // Check if PIN already exists
+  const umap = ensureUserMap(sn);
+  if (umap.has(pinVal)) {
+    return res.status(400).json({
+      error: `PIN ${pinVal} already exists`,
+      suggestedPin: getNextAvailablePin(sn),
+    });
+  }
 
   // Build parts with TAB separators (some firmware require tabs explicitly)
   function join(parts) {
@@ -558,10 +604,12 @@ app.post('/api/device/add-user', (req, res) => {
   while (commands.length) commands.pop();
   deduped.forEach((c) => commands.push(c));
 
-  console.log(`[add-user] SN=${sn} queued ${deduped.length} line(s):`, deduped);
+  console.log(
+    `[add-user] SN=${sn} PIN=${pinVal} Name=${nameVal} queued ${deduped.length} line(s):`,
+    deduped
+  );
 
   // Optimistic cache
-  const umap = ensureUserMap(sn);
   const existing = umap.get(pinVal) || {};
   const nowIso = new Date().toISOString();
   let optimisticApplied = false;
@@ -597,6 +645,9 @@ app.post('/api/device/add-user', (req, res) => {
     ok: true,
     enqueued: deduped,
     queueSize: q.length,
+    assignedPin: pinVal,
+    wasAutoGenerated: !pin,
+    nextAvailablePin: getNextAvailablePin(sn),
     note: 'If user still absent: ensure USE_CRLF=1, try minimal=true&compat=true, review /iclock/cdata for USER reply, and verify device allows remote user creation.',
     pinLabelUsed: pinLabel,
     autoDetectedPinKey: autoKey || null,
@@ -659,22 +710,6 @@ app.post('/api/device/force-user-sync', (req, res) => {
   res.json({ ok: true, queued: 'C:1:DATA QUERY USERINFO', clearOptimistic: !!clearOptimistic });
 });
 
-// // Inspect recent raw cdata event summaries
-// app.get('/api/device/cdata-events', (req, res) => {
-//   const sn = req.query.sn || req.query.SN;
-//   if (!sn) return res.status(400).json({ error: 'sn is required' });
-//   const events = (cdataEvents.get(sn) || []).slice(-100);
-//   res.json({ sn, count: events.length, events });
-// });
-
-// // Raw cdata bodies (recent)
-// app.get('/api/device/raw-cdata', (req, res) => {
-//   const sn = req.query.sn || req.query.SN;
-//   if (!sn) return res.status(400).json({ error: 'sn is required' });
-//   const arr = (rawCDataStore.get(sn) || []).slice(-50);
-//   res.json({ sn, count: arr.length, items: arr });
-// });
-
 // Poll history
 app.get('/api/device/polls', (req, res) => {
   const sn = req.query.sn || req.query.SN;
@@ -690,12 +725,12 @@ app.post('/api/device/delete-user', (req, res) => {
   const { pin } = req.body || {};
   if (!pin) return res.status(400).json({ error: 'pin is required' });
   const variants = [
-    `DELETE USER PIN=${pin}`,
-    `DATA DELETE USER PIN=${pin}`,
-    `CLEAR USER PIN=${pin}`,
-    `REMOVE USER PIN=${pin}`,
-    `GET USER PIN=${pin}`,
-    `DATA QUERY USER PIN=${pin}`,
+    `C:1:DELETE USER PIN=${pin}`,
+    `C:2:DATA DELETE USER PIN=${pin}`,
+    `C:3:CLEAR USER PIN=${pin}`,
+    `C:4:REMOVE USER PIN=${pin}`,
+    `C:5:GET USER PIN=${pin}`,
+    `C:6:DATA QUERY USER PIN=${pin}`,
   ];
   const q = ensureQueue(sn);
   variants.forEach((v) => q.push(v));
@@ -707,21 +742,27 @@ app.post('/api/device/delete-user', (req, res) => {
 });
 
 // Clone an existing user (server-side) to a new PIN using stored map
-app.post('/api/device/clone-user', (req, res) => {
+app.post('/api/device/clone-user', async (req, res) => {
   const sn = req.query.sn || req.query.SN;
   if (!sn) return res.status(400).json({ error: 'sn is required' });
+
   const { fromPin, toPin, compat } = req.body || {};
   if (!fromPin || !toPin) return res.status(400).json({ error: 'fromPin and toPin required' });
+
+  // Ensure users are fetched before cloning
+  await ensureUsersFetched(sn);
+
   const umap = ensureUserMap(sn);
   const src = umap.get(String(fromPin));
   if (!src) return res.status(404).json({ error: 'fromPin not found' });
+
   // Reuse add-user logic by constructing body
   const body = {
     pin: String(toPin),
-    name: src.name,
-    card: src.card,
-    privilege: Number(src.privilege || 0),
-    department: src.department,
+    name: src.name || src.Name,
+    card: src.card || src.Card,
+    privilege: Number(src.privilege || src.Pri || 0),
+    department: src.department || src.Dept,
     compat: !!compat,
   };
   req.body = body; // mutate request to reuse handler (safe here in-process)
@@ -737,9 +778,12 @@ app.post('/api/device/drip-mode', (req, res) => {
 });
 
 // Get next available PIN for a device
-app.get('/api/device/next-pin', (req, res) => {
+app.get('/api/device/next-pin', async (req, res) => {
   const sn = req.query.sn || req.query.SN;
   if (!sn) return res.status(400).json({ error: 'sn is required' });
+
+  // Ensure users are fetched before calculating next PIN
+  await ensureUsersFetched(sn);
 
   const startPin = Number(req.query.startPin) || 1;
   const nextPin = getNextAvailablePin(sn, startPin);
@@ -801,7 +845,8 @@ app.post('/api/device/custom-command', (req, res) => {
 
 // Helper function to find next available PIN for a device
 function getNextAvailablePin(sn, startPin = 1) {
-  const umap = usersByDevice.get(sn) || new Map();
+  // Use ensureUserMap to get existing map (already fetched by calling function)
+  const umap = ensureUserMap(sn);
   let pin = Number(startPin) || 1;
 
   // Find the highest existing PIN to start from
@@ -822,9 +867,12 @@ function getNextAvailablePin(sn, startPin = 1) {
 }
 
 // Bulk user insertion with auto PIN generation
-app.post('/api/device/bulk-add-users', (req, res) => {
+app.post('/api/device/bulk-add-users', async (req, res) => {
   const sn = req.query.sn || req.query.SN;
   if (!sn) return res.status(400).json({ error: 'sn is required' });
+
+  // Ensure users are fetched before bulk operations
+  await ensureUsersFetched(sn);
 
   const {
     users, // array of user objects: [{ name: 'Anik2', card?: '123', privilege?: 0, department?: '', password?: '', pin2?: '', group?: '' }]
