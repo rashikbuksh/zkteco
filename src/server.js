@@ -33,6 +33,12 @@ const defaultLookbackHours = DEFAULT_LOOKBACK_HOURS;
 const commandSyntax = String(ICLOCK_COMMAND || 'DATA_QUERY').toUpperCase();
 let dripMode = false; // when true, send only one command per /iclock/getrequest poll
 
+// log all the requests
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
+  next();
+});
+
 // Utilities
 function ensureQueue(sn) {
   if (!commandQueue.has(sn)) commandQueue.set(sn, []);
