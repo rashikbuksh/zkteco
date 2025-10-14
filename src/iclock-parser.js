@@ -37,39 +37,31 @@ function parseLine(line) {
   const raw = line.trim();
   if (!raw) return null;
 
-  // Identify by first token
   const firstToken = raw.split('\t', 1)[0];
-
-  // Also by first space-separated token
   const firstSpace = raw.split(' ', 1)[0];
 
-  switch (true) {
-    // USER profile
-    case firstSpace === 'USER': {
+  switch (firstSpace) {
+    case 'USER': {
       const kv = kvPairs(raw.substring(5));
       return { type: 'USER', ...kv };
     }
 
-    // BIODATA (finger/face/palm templates)
-    case firstSpace === 'BIODATA': {
+    case 'BIODATA': {
       const kv = kvPairs(raw.substring(8));
       return { type: 'BIODATA', ...kv };
     }
 
-    // USERPIC meta
-    case firstSpace === 'USERPIC': {
+    case 'USERPIC': {
       const kv = kvPairs(raw.substring(8));
       return { type: 'USERPIC', ...kv };
     }
 
-    // BIOPHOTO full image
-    case firstSpace === 'BIOPHOTO': {
+    case 'BIOPHOTO': {
       const kv = kvPairs(raw.substring(9));
       return { type: 'BIOPHOTO', ...kv };
     }
 
-    // OPLOG operation log (tab separated)
-    case firstSpace === 'OPLOG': {
+    case 'OPLOG': {
       const parts = raw.split('\t');
       const head = parts[0].split(' ');
       const opCode = head[1];

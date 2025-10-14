@@ -44,6 +44,7 @@ function ensureQueue(sn) {
   if (!commandQueue.has(sn)) commandQueue.set(sn, []);
   return commandQueue.get(sn);
 }
+
 function ensureUserMap(sn) {
   if (!usersByDevice.has(sn)) usersByDevice.set(sn, new Map());
   return usersByDevice.get(sn);
@@ -118,10 +119,13 @@ function recordCDataEvent(sn, summary) {
   const cmds = sentCommands.get(sn);
   if (cmds) {
     for (const c of cmds) {
-      if (c.deliveredAt && !c.respondedAt) {
-        if (!c.postSeenAfterDelivery && c.deliveredAt <= summary.at) {
-          c.postSeenAfterDelivery = true;
-        }
+      if (
+        c.deliveredAt &&
+        !c.respondedAt &&
+        !c.postSeenAfterDelivery &&
+        c.deliveredAt <= summary.at
+      ) {
+        c.postSeenAfterDelivery = true;
       }
     }
   }
@@ -256,9 +260,6 @@ app.get('/iclock/ping', (req, res) => {
   state.lastSeenAt = new Date().toISOString();
 
   deviceState.set(sn, state);
-
-  console.log(`[ping] SN=${sn}`);
-  console.log(state, 'deviceState');
 
   res.status(200).send('OK');
 });
@@ -427,12 +428,6 @@ app.post('/iclock/cdata', (req, res) => {
       `[user-summary] SN=${sn} added=${userCount} duplicates_skipped=${duplicateCount} total_users=${totalUsers}`
     );
   }
-
-  // console.log(usersByDevice, 'usersByDevice');
-
-  // console.log('pushedLogs', pushedLogs);
-
-  // console.log('informationLogs', informationLogs);
 
   const st = deviceState.get(sn) || {};
   st.lastSeenAt = new Date().toISOString();
